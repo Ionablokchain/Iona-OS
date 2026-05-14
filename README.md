@@ -1,3 +1,4 @@
+<img width="737" height="420" alt="iona os" src="https://github.com/user-attachments/assets/c86e3e48-e4c0-4946-9522-27f11175e87a" />
 # IONA OS Kernel v0.6.0
 
 > **Status:** Bare-metal x86_64 kernel in Rust — boots in QEMU, kernel subsystems functional, userspace ELFs written but not yet cross-compiled.
