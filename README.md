@@ -1,3 +1,4 @@
+
 <img width="737" height="420" alt="iona os" src="https://github.com/user-attachments/assets/c86e3e48-e4c0-4946-9522-27f11175e87a" />
 # IONA OS
 
@@ -28,6 +29,7 @@ programming languages — all built by a single founder over 10 years.
 | **Dual-use by design** | Consumer, enterprise, and government-grade security — air-gappable, onion-routed, auditable. |
 | **Sovereign by default** | No telemetry, no cloud dependency, no foreign code. Every line was written by the founder. |
 
+<img width="764" height="432" alt="test" src="https://github.com/user-attachments/assets/02914fcc-a35c-4816-9bb9-4e90b3ce07b5" />
 ---
 
 ## Architecture (v0.7.0)
