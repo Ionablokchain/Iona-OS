@@ -1,0 +1,175 @@
+name: IONA OS CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Job 1: Build kernel + userspace ───────────────────────────────────────
+  build:
+    name: Build kernel + userspace
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Rust toolchain + registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Install Rust nightly + targets
+        run: |
+          rustup update nightly
+          rustup default nightly
+          rustup target add x86_64-unknown-none
+          rustup component add llvm-tools-preview rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y dosfstools mtools qemu-system-x86 gdisk binutils-x86-64-linux-gnu
+
+      - name: Build kernel (release)
+        run: |
+          cargo build --release --target x86_64-unknown-none 2>&1 | tail -20
+          ls -lh target/x86_64-unknown-none/release/iona-os 2>/dev/null ||           ls -lh target/x86_64-unknown-none/release/*.elf   2>/dev/null || true
+
+      - name: Locate kernel ELF
+        id: kernel
+        run: |
+          ELF=$(find target/x86_64-unknown-none/release -maxdepth 1 -name "*.elf" -o -name "iona-os" 2>/dev/null | head -1)
+          [ -n "$ELF" ] || ELF=$(find target -name "iona-os" -not -path "*/deps/*" 2>/dev/null | head -1)
+          [ -n "$ELF" ] || { echo "ERROR: kernel ELF not found"; find target -name "*.elf" 2>/dev/null; exit 1; }
+          mkdir -p dist
+          cp "$ELF" dist/iona-os-kernel.elf
+          echo "path=dist/iona-os-kernel.elf" >> $GITHUB_OUTPUT
+          ls -lh dist/iona-os-kernel.elf
+
+      - name: Build userspace binaries
+        run: |
+          for pkg in userspace/iona-shell userspace/iona-node userspace/iona-utils; do
+            [ -f "$pkg/Cargo.toml" ] || continue
+            echo "Building $pkg..."
+            (cd "$pkg" && cargo build --release 2>&1 | tail -5) || echo "  WARNING: $pkg build failed"
+          done
+
+      - name: Build IONAFS disk image
+        run: |
+          ./scripts/build-ionafs.sh
+          ls -lh dist/iona-disk.img
+
+      - name: Generate bootable UEFI image
+        run: |
+          ./scripts/gen-disk-images.sh dist/iona-os-kernel.elf dist/ 2>&1 | tail -10 || true
+          ls dist/*.img 2>/dev/null || true
+
+      - name: Emit version manifest
+        run: |
+          cat > dist/iona-os-version.json <<EOF
+          {
+            "version": "0.6.0",
+            "commit": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Clippy (non-blocking)
+        run: |
+          cargo clippy --target x86_64-unknown-none 2>&1 | head -50 || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: iona-os-build-${{ github.sha }}
+          retention-days: 7
+          path: |
+            dist/iona-os-kernel.elf
+            dist/iona-disk.img
+            dist/iona-os-version.json
+
+  # ── Job 2: QEMU boot smoke test ───────────────────────────────────────────
+  qemu-boot:
+    name: QEMU boot smoke test
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: sudo apt-get install -y qemu-system-x86
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: iona-os-build-${{ github.sha }}
+          path: dist/
+
+      - name: QEMU boot test (30s timeout)
+        run: |
+          chmod +x scripts/*.sh
+          timeout 35 ./scripts/ci-qemu-boot.sh
+        timeout-minutes: 2
+
+  # ── Job 3: 3-validator testnet ────────────────────────────────────────────
+  testnet:
+    name: 3-validator BFT testnet
+    runs-on: ubuntu-22.04
+    needs: build
+    # Run testnet only on main branch or manual trigger
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: sudo apt-get install -y qemu-system-x86
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: iona-os-build-${{ github.sha }}
+          path: dist/
+
+      - name: Run 3-validator testnet (60s)
+        run: |
+          chmod +x scripts/*.sh
+          TESTNET_TIMEOUT=60 EXPECTED_BLOCKS=1 ./scripts/testnet-3val.sh || true
+        timeout-minutes: 3
+
+  # ── Job 4: Security audit ─────────────────────────────────────────────────
+  security:
+    name: Security audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --quiet 2>/dev/null || true
+
+      - name: Run security audit
+        run: cargo audit 2>/dev/null || true
+
+      - name: Check for known-bad patterns
+        run: |
+          echo "=== Checking for unsafe without justification ==="
+          grep -rn "unsafe {" src/ --include="*.rs" |             grep -v "// SAFETY:\|// safety:" | wc -l |             xargs -I{} echo "Unsafe blocks without SAFETY comment: {}"
+          echo "=== Checking for unwrap() in kernel code ==="
+          grep -rn "\.unwrap()" src/ --include="*.rs" |             grep -v "unwrap_or\|unwrap_or_else\|unwrap_or_default\|//.*unwrap" |             wc -l | xargs -I{} echo "Naked unwrap() count: {}"

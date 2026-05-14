@@ -1,0 +1,58 @@
+[package]
+name        = "iona-os-kernel"
+version     = "0.6.0"
+edition     = "2021"
+description = "IONA OS — production-grade bare-metal kernel x86_64"
+license     = "Apache-2.0"
+
+[[bin]]
+name = "iona-os-kernel"
+path = "src/main.rs"
+
+[dependencies]
+spin              = "0.9"
+x86_64            = "0.15"
+bootloader_api    = "0.11"
+linked_list_allocator = "0.10"
+xmas-elf          = "0.9"
+smoltcp           = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-igmp", "socket-tcp", "socket-udp", "alloc", "socket-dhcpv4"] }
+wasmi             = { version = "0.31", default-features = false }
+bitflags          = "2"
+log               = { version = "0.4", default-features = false }
+serde             = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard          = { version = "1", default-features = false, features = ["alloc"] }
+thiserror-no-std  = "2"
+hex               = { version = "0.4", default-features = false }
+raw-cpuid         = { version = "11",   default-features = false }
+libm              = { version = "0.2",   default-features = false }
+
+# bootloader disk-image generation is handled by scripts/gen-disk-images.sh
+# [build-dependencies]
+# bootloader = { version = "0.11", features = ["uefi", "bios"] }
+
+[features]
+# dev-signing: enables EcdsaSigner/EcdsaVerifier for consensus testing
+dev-signing = []
+
+[profile.dev]
+panic     = "abort"
+opt-level = 1
+
+[profile.release]
+panic         = "abort"
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = false
+
+[workspace]
+members = [
+    ".",
+    "userspace/iona-node",
+    "userspace/iona-syscall",
+    "userspace/iona-utils",
+]
+# Exclude kernel from userspace builds
+# Use: cargo build -p iona-node  (userspace only)
+#      cargo build               (kernel only, target=x86_64-unknown-none)
+resolver = "2"

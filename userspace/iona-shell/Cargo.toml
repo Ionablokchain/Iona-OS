@@ -1,0 +1,18 @@
+[package]
+name    = "iona-shell"
+version = "0.6.0"
+edition = "2021"
+
+[[bin]]
+name = "iona-shell"
+path = "src/main.rs"
+
+[dependencies]
+iona-syscall = { path = "../iona-syscall" }
+
+[profile.release]
+panic         = "abort"
+opt-level     = "s"
+lto           = true
+codegen-units = 1
+strip         = true
