@@ -1,148 +1,332 @@
 //! Virtio Block Device Driver
-//! Citim/scriem sectoare de 512 bytes via VirtQueue
+//!
+//! Reads and writes 512‑byte sectors via VirtQueue.
+//! Implements retry logic and a small read cache.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::mem::ManuallyDrop;
+use core::ptr;
 use spin::Mutex;
 use super::{VirtQueue, init_device};
 use crate::pci::PciDevice;
+use crate::arch::x86_64::timer::sleep_ms;
+use thiserror::Error;
 
-const VIRTIO_BLK_T_IN:  u32 = 0; // read
-const VIRTIO_BLK_T_OUT: u32 = 1; // write
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Sector size in bytes (standard for virtio‑blk).
+pub const SECTOR_SIZE: usize = 512;
+
+/// Number of retries for I/O operations.
+const RETRY_COUNT: usize = 3;
+
+/// Delay between retries in milliseconds.
+const RETRY_DELAY_MS: u64 = 10;
+
+/// Maximum number of cached sectors.
+const CACHE_SIZE: usize = 16;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during virtio‑blk operations.
+#[derive(Debug, Error)]
+pub enum VirtioBlkError {
+    #[error("virtio-blk device not initialized")]
+    NotInitialized,
+    #[error("I/O error: status = {status}")]
+    IoError { status: u8 },
+    #[error("buffer length mismatch: expected {expected}, got {actual}")]
+    BufferLengthMismatch { expected: usize, actual: usize },
+    #[error("DMA mapping failed")]
+    DmaMappingFailed,
+    #[error("queue operation failed: {0}")]
+    QueueError(&'static str),
+}
+
+pub type VirtioBlkResult<T> = Result<T, VirtioBlkError>;
+
+// -----------------------------------------------------------------------------
+// Request structures
+// -----------------------------------------------------------------------------
 
 #[repr(C)]
 struct BlkRequest {
-    type_:   u32,
-    ioprio:  u32,
-    sector:  u64,
+    type_: u32,
+    ioprio: u32,
+    sector: u64,
 }
 
 #[repr(C)]
-struct BlkStatus { status: u8 }
-
-pub struct VirtioBlk {
-    queue:    VirtQueue,
-    capacity: u64, // sectoare de 512 bytes
+struct BlkStatus {
+    status: u8,
 }
 
-unsafe impl Send for VirtioBlk {}
+// -----------------------------------------------------------------------------
+// VirtioBlk driver
+// -----------------------------------------------------------------------------
+
+/// Virtio block device driver.
+pub struct VirtioBlk {
+    queue: VirtQueue,
+    capacity: u64, // number of 512‑byte sectors
+}
+
+/// Global singleton (protected by Mutex).
 static DISK: Mutex<Option<VirtioBlk>> = Mutex::new(None);
 
+/// Block cache (LRU‑like, only for reads).
+static BLOCK_CACHE: spin::Lazy<Mutex<BTreeMap<u64, Vec<u8>>>> =
+    spin::Lazy::new(|| Mutex::new(BTreeMap::new()));
+
+// -----------------------------------------------------------------------------
+// Implementation
+// -----------------------------------------------------------------------------
+
 impl VirtioBlk {
-    pub fn init(dev: &PciDevice) -> Option<()> {
+    /// Initialize the device from PCI configuration.
+    pub fn init(dev: &PciDevice) -> Option<Self> {
         let io_base = init_device(dev)?;
-        // Citim capacitatea (offset 0x14 în config space virtio)
+        // Read capacity from virtio config space (offset 0x14: low 32 bits, 0x18: high 32 bits)
         let cap_lo = crate::pci::config_read_u32(dev.addr.bus, dev.addr.device, dev.addr.function, 0x14);
         let cap_hi = crate::pci::config_read_u32(dev.addr.bus, dev.addr.device, dev.addr.function, 0x18);
         let capacity = (cap_hi as u64) << 32 | cap_lo as u64;
 
         let queue = VirtQueue::new(io_base, 0)?;
         crate::serial_println!("  [VIRTIO-BLK] capacity={} sectors ({} MB)",
-            capacity, capacity * 512 / 1_048_576);
-
-        *DISK.lock() = Some(VirtioBlk { queue, capacity });
-        Some(())
+            capacity, capacity * SECTOR_SIZE as u64 / 1_048_576);
+        Some(VirtioBlk { queue, capacity })
     }
 
-    pub fn read_sectors(&mut self, lba: u64, count: usize, buf: &mut [u8]) {
-        assert_eq!(buf.len(), count * 512);
-        let req = Box::new(BlkRequest { type_: VIRTIO_BLK_T_IN, ioprio: 0, sector: lba });
+    /// Read `count` sectors starting at `lba` into `buf`.
+    /// Buffer must be exactly `count * SECTOR_SIZE` bytes.
+    pub fn read_sectors(&mut self, lba: u64, count: usize, buf: &mut [u8]) -> VirtioBlkResult<()> {
+        let expected_len = count * SECTOR_SIZE;
+        if buf.len() != expected_len {
+            return Err(VirtioBlkError::BufferLengthMismatch {
+                expected: expected_len,
+                actual: buf.len(),
+            });
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        // Prepare request and status buffers.
+        let req = Box::new(BlkRequest {
+            type_: VIRTIO_BLK_T_IN,
+            ioprio: 0,
+            sector: lba,
+        });
         let status = Box::new(BlkStatus { status: 0xFF });
 
-        let req_phys   = (&*req as *const _) as u64;
-        let buf_phys   = buf.as_ptr() as u64;
-        let status_phys = (&*status as *const _) as u64;
+        // Get physical addresses.
+        let req_phys = virt_to_phys(&*req);
+        let buf_phys = virt_to_phys(buf.as_mut_ptr());
+        let status_phys = virt_to_phys(&*status);
 
-        // 3 descriptori în lanț: request header | data buffer (device write) | status
-        self.queue.send(req_phys, core::mem::size_of::<BlkRequest>() as u32, 1); // NEXT
-        self.queue.send(buf_phys, buf.len() as u32, 1 | 2); // NEXT | WRITE
-        self.queue.send(status_phys, 1, 2); // WRITE only
+        // Build descriptor chain:
+        // desc0: request header (device reads)
+        // desc1: data buffer (device writes)
+        // desc2: status (device writes)
+        self.queue.send(req_phys, core::mem::size_of::<BlkRequest>() as u32, 1)?; // NEXT
+        self.queue.send(buf_phys, buf.len() as u32, 1 | 2)?; // NEXT | WRITE
+        self.queue.send(status_phys, 1, 2)?; // WRITE
         self.queue.wait_used();
 
-        assert_eq!((*status).status, 0, "virtio-blk read error");
+        if status.status != 0 {
+            return Err(VirtioBlkError::IoError { status: status.status });
+        }
+
+        // Prevent deallocation of buffers (they will be reused or dropped later).
         core::mem::forget(req);
         core::mem::forget(status);
+        Ok(())
     }
 
-    pub fn write_sectors(&mut self, lba: u64, buf: &[u8]) {
-        assert_eq!(buf.len() % 512, 0);
-        let req = Box::new(BlkRequest { type_: VIRTIO_BLK_T_OUT, ioprio: 0, sector: lba });
+    /// Write a single sector at `lba` (or multiple aligned sectors).
+    /// Buffer must be a multiple of `SECTOR_SIZE`.
+    pub fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> VirtioBlkResult<()> {
+        if buf.len() % SECTOR_SIZE != 0 {
+            return Err(VirtioBlkError::BufferLengthMismatch {
+                expected: buf.len() / SECTOR_SIZE * SECTOR_SIZE,
+                actual: buf.len(),
+            });
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let req = Box::new(BlkRequest {
+            type_: VIRTIO_BLK_T_OUT,
+            ioprio: 0,
+            sector: lba,
+        });
         let status = Box::new(BlkStatus { status: 0xFF });
-        self.queue.send((&*req as *const _) as u64, core::mem::size_of::<BlkRequest>() as u32, 1);
-        self.queue.send(buf.as_ptr() as u64, buf.len() as u32, 1);
-        self.queue.send((&*status as *const _) as u64, 1, 2);
+
+        let req_phys = virt_to_phys(&*req);
+        let buf_phys = virt_to_phys(buf.as_ptr());
+        let status_phys = virt_to_phys(&*status);
+
+        self.queue.send(req_phys, core::mem::size_of::<BlkRequest>() as u32, 1)?;
+        self.queue.send(buf_phys, buf.len() as u32, 1)?;
+        self.queue.send(status_phys, 1, 2)?;
         self.queue.wait_used();
-        assert_eq!((*status).status, 0, "virtio-blk write error");
-        core::mem::forget(req); core::mem::forget(status);
+
+        if status.status != 0 {
+            return Err(VirtioBlkError::IoError { status: status.status });
+        }
+
+        core::mem::forget(req);
+        core::mem::forget(status);
+        Ok(())
+    }
+
+    /// Invalidate cache for a specific sector.
+    pub fn invalidate_cache(&self, lba: u64) {
+        let mut cache = BLOCK_CACHE.lock();
+        cache.remove(&lba);
     }
 }
 
-/// API publică pentru filesystemuri
-pub fn read_sectors(lba: u64, count: usize, buf: &mut [u8]) -> bool {
-    match DISK.lock().as_mut() {
-        Some(d) => { d.read_sectors(lba, count, buf); true }
-        None    => false,
-    }
+// -----------------------------------------------------------------------------
+// Helper: convert virtual address to physical (placeholder – real kernel would use page tables)
+// -----------------------------------------------------------------------------
+#[inline(never)]
+fn virt_to_phys<T>(ptr: *const T) -> u64 {
+    // In a real kernel, this would translate the virtual address using the current page tables.
+    // For simplicity, we assume identity mapping for DMA buffers or use proper DMA API.
+    // This placeholder returns the value as if identity mapping.
+    ptr as u64
 }
 
-pub fn write_sectors(lba: u64, buf: &[u8]) -> bool {
-    match DISK.lock().as_mut() {
-        Some(d) => { d.write_sectors(lba, buf); true }
-        None    => false,
-    }
+// -----------------------------------------------------------------------------
+// Public API (global singleton)
+// -----------------------------------------------------------------------------
+
+/// Check if the virtio‑blk device is present.
+pub fn is_present() -> bool {
+    DISK.lock().is_some()
 }
 
-pub fn is_present() -> bool { DISK.lock().is_some() }
+/// Check if the device is available (alias for `is_present`).
+pub fn is_available() -> bool {
+    is_present()
+}
 
-/// Check if virtio-blk device is available
-pub fn is_available() -> bool { DISK.lock().is_some() }
-
-/// Return disk capacity in MB
+/// Return disk capacity in megabytes.
 pub fn capacity_mb() -> Option<u64> {
-    DISK.lock().as_ref().map(|d| d.capacity * 512 / 1_048_576)
+    DISK.lock().as_ref().map(|d| d.capacity * SECTOR_SIZE as u64 / 1_048_576)
 }
 
+/// Try to initialize the device from a PCI device.
 pub fn try_init(dev: &PciDevice) -> bool {
-    VirtioBlk::init(dev).is_some()
-}
-
-/// Read with retry — attempts up to 3 times on failure
-pub fn read_sectors_retry(lba: u64, count: usize, buf: &mut [u8]) -> bool {
-    for attempt in 0..3 {
-        if read_sectors(lba, count, buf) { return true; }
-        crate::serial_println!("[VIRTIO-BLK] read retry {}/3 lba={}", attempt+1, lba);
-        crate::arch::x86_64::timer::sleep_ms(10);
+    if let Some(disk) = VirtioBlk::init(dev) {
+        *DISK.lock() = Some(disk);
+        true
+    } else {
+        false
     }
-    crate::serial_println!("[VIRTIO-BLK] read FAILED after 3 retries lba={}", lba);
-    false
 }
 
-/// Write with retry + verify
-pub fn write_sectors_retry(lba: u64, buf: &[u8]) -> bool {
-    for attempt in 0..3 {
-        if write_sectors(lba, buf) { return true; }
-        crate::serial_println!("[VIRTIO-BLK] write retry {}/3 lba={}", attempt+1, lba);
-        crate::arch::x86_64::timer::sleep_ms(10);
+/// Read sectors (no retry).
+pub fn read_sectors(lba: u64, count: usize, buf: &mut [u8]) -> VirtioBlkResult<()> {
+    let mut guard = DISK.lock();
+    let disk = guard.as_mut().ok_or(VirtioBlkError::NotInitialized)?;
+    disk.read_sectors(lba, count, buf)
+}
+
+/// Write sectors (no retry).
+pub fn write_sectors(lba: u64, buf: &[u8]) -> VirtioBlkResult<()> {
+    let mut guard = DISK.lock();
+    let disk = guard.as_mut().ok_or(VirtioBlkError::NotInitialized)?;
+    disk.write_sectors(lba, buf)
+}
+
+/// Read with retry – attempts up to `RETRY_COUNT` times.
+pub fn read_sectors_retry(lba: u64, count: usize, buf: &mut [u8]) -> VirtioBlkResult<()> {
+    let mut last_err = VirtioBlkError::NotInitialized;
+    for attempt in 0..RETRY_COUNT {
+        match read_sectors(lba, count, buf) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                crate::serial_println!("[VIRTIO-BLK] read retry {}/{} lba={}", attempt + 1, RETRY_COUNT, lba);
+                sleep_ms(RETRY_DELAY_MS);
+            }
+        }
     }
-    false
+    Err(last_err)
 }
 
-/// Block cache — 16 cached sectors to reduce I/O
-static BLOCK_CACHE: spin::Lazy<spin::Mutex<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>> =
-    spin::Lazy::new(|| spin::Mutex::new(alloc::collections::BTreeMap::new()));
+/// Write with retry.
+pub fn write_sectors_retry(lba: u64, buf: &[u8]) -> VirtioBlkResult<()> {
+    let mut last_err = VirtioBlkError::NotInitialized;
+    for attempt in 0..RETRY_COUNT {
+        match write_sectors(lba, buf) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                crate::serial_println!("[VIRTIO-BLK] write retry {}/{} lba={}", attempt + 1, RETRY_COUNT, lba);
+                sleep_ms(RETRY_DELAY_MS);
+            }
+        }
+    }
+    Err(last_err)
+}
 
-pub fn read_cached(lba: u64, buf: &mut [u8]) -> bool {
+/// Read a single sector with caching (simple LRU).
+pub fn read_cached(lba: u64, buf: &mut [u8]) -> VirtioBlkResult<()> {
+    if buf.len() < SECTOR_SIZE {
+        return Err(VirtioBlkError::BufferLengthMismatch {
+            expected: SECTOR_SIZE,
+            actual: buf.len(),
+        });
+    }
     {
         let cache = BLOCK_CACHE.lock();
         if let Some(cached) = cache.get(&lba) {
             let copy_len = cached.len().min(buf.len());
             buf[..copy_len].copy_from_slice(&cached[..copy_len]);
-            return true;
+            return Ok(());
         }
     }
-    if read_sectors(lba, 1, buf) {
-        let mut cache = BLOCK_CACHE.lock();
-        if cache.len() >= 16 { cache.pop_first(); } // evict oldest
-        cache.insert(lba, buf.to_vec());
-        true
-    } else { false }
+    // Not in cache – read from disk.
+    read_sectors_retry(lba, 1, &mut buf[..SECTOR_SIZE])?;
+    // Store in cache (evict oldest if needed).
+    let mut cache = BLOCK_CACHE.lock();
+    if cache.len() >= CACHE_SIZE {
+        if let Some(oldest) = cache.first_entry() {
+            cache.remove(oldest.key());
+        }
+    }
+    cache.insert(lba, buf[..SECTOR_SIZE].to_vec());
+    Ok(())
+}
+
+/// Invalidate a specific cache entry.
+pub fn invalidate_cache(lba: u64) {
+    if let Some(disk) = DISK.lock().as_ref() {
+        disk.invalidate_cache(lba);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests (compile‑time only)
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(SECTOR_SIZE, 512);
+        assert_eq!(RETRY_COUNT, 3);
+    }
 }
