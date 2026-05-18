@@ -1,77 +1,147 @@
 
 <img width="737" height="420" alt="iona os" src="https://github.com/user-attachments/assets/c86e3e48-e4c0-4946-9522-27f11175e87a" />
 
-IONA — Sovereign Digital Ecosystem
-A complete, post-quantum computing platform built from scratch for strategic digital autonomy.
 
-IONA is an integrated, bare-metal operating system and Layer 1 blockchain ecosystem, architected, and implemented by a single founder. It provides a verifiably secure, fully autonomous digital infrastructure designed to eliminate dependence on foreign-controlled software and hardware supply chains.
+# IONA OS — The Sovereign Operating System
 
-Mission: To provide a single, cohesive, and audited alternative to the current digital monoculture, enabling true sovereignty for nations, critical infrastructure, and individuals.
+> **Building a complete sovereign digital ecosystem — OS (PC + Phone), L1 blockchain, programming languages, and AI — from scratch.**
 
-Executive Summary
-IONA is not a Linux distribution or a hardened fork of an existing OS. It is a new architecture, written entirely from scratch in Rust, that integrates a memory-safe kernel, a post-quantum L1 blockchain, an autonomous AI agent, and a custom systems programming language into a single, unified platform. The project represents over a decade of focused R&D and over half a million lines of original code, entirely self-funded.
+**IONA OS** is a bare-metal, monolithic operating system kernel for x86_64, written from scratch in Rust. It is the secure foundation of the IONA ecosystem, designed to provide a verifiably autonomous, post-quantum computing environment. It features its own kernel, filesystem, GUI, network stack, and AI agent, eliminating any dependence on Linux, BSD, or Windows code.
 
-Key Differentiators
-
-Capability                               Description
-
-Zero-Trust                                Architecture	Own kernel, own filesystem (IONAFS),
-                                          own network stack. No Linux, BSD, or Windows heritage.
-
-Post-Quantum Security by Default	        NIST-standardized algorithms (Dilithium3, Kyber-768,
-                                          SPHINCS+) integrated at the system level.
-
-Full Legacy Compatibility               	Runs existing Windows (.exe) and Linux (ELF) applications
-                                          natively, ensuring operational continuity.
-
-Sovereign AI	                           On-device, private AI agent using a local 7B LLM, capable
-                                         of proactive system monitoring and kernel-level self-healing.
-
-Integrated L1 Protocol	                 Native blockchain with EVM compatibility, DAG-based consensus,
-                                         and constitutional on-chain governance.
-
-Dual-Use by Design	                     Hardened kernel, air-gap capability, and encrypted mesh networking 
-                                         for consumer, enterprise, and defense applications.
-
-The Ecosystem
-IONA is composed of seven core, interconnected technologies, each a critical pillar of the larger vision.
+**Mission:** To provide a memory-safe, secure-by-design, and fully sovereign compute layer for nations, critical infrastructure, and individuals.
 
 <img width="764" height="432" alt="test" src="https://github.com/user-attachments/assets/02914fcc-a35c-4816-9bb9-4e90b3ce07b5" />
 
-Repository	                         Function
-Iona-OS	                             The sovereign desktop kernel (x86_64), with a 
-                                     custom GUI, browser, and full development toolchain.
+> ⚠️ **Note:** This repository contains the public version of the IONA OS kernel (v0.7.0), published to demonstrate architecture, build reproducibility, and subsystem maturity. The full IONA OS desktop environment — with compositor, Windows/Linux binary compatibility, 3D engine, on-device AI agent, mesh networking, and hundreds of native apps — is significantly more advanced. A live demo can be arranged upon request.
 
-Iona-OS-Phone	A complete sovereign mobile OS (ARM64), with native hardware drivers and a premium user interface.
+---
 
-Iona-AI	The autonomous agent system with deep OS integration, self-healing capabilities, and multi-device sync.
+## 🛡️ Executive Summary
 
-Iona-protocol	The security-first L1 blockchain for sovereign digital transactions and governance.
+IONA OS is not a Linux distribution. It is a new operating system architecture, built entirely from scratch. The kernel, memory manager, scheduler, filesystem, and drivers are all original work, written in Rust to eliminate entire classes of memory-safety vulnerabilities. It integrates post-quantum cryptography as a default, not an afterthought, and is designed to run existing Windows and Linux applications natively.
 
-Carpel	A new systems programming language that makes safe, low-level development accessible and productive.
+The kernel currently boots on real hardware (AMD Barcelo, Intel Alder Lake) and in QEMU, with over 50 subsystem tests passing.
 
-Flux	An experimental temporal-quantum language exploring the frontiers of a new computing paradigm.
+---
 
--Nihilo-OS	A radical proof-of-concept for an OS without files, built on the principles of causal probability.
+## ⚡ Key Differentiators
 
-Project at a Glance
+| Capability | Description |
+| :--- | :--- |
+| **Built From Scratch** | Own kernel, own memory manager, own scheduler, own filesystem. No Linux. No BSD. No Windows. |
+| **Memory-Safe (Rust)** | ~90% of the kernel is written in Rust. Zero buffer overflows, zero use-after-free. |
+| **Post-Quantum by Default** | NIST-standardized algorithms (Dilithium3, Kyber-768, SPHINCS+) integrated at the kernel level. |
+| **Full Binary Compatibility** | Runs existing Windows (.exe) and Linux (ELF) applications natively. |
+| **Sovereign AI** | On-device, private AI agent with deep OS integration and kernel-level self-healing. |
+| **Dual-Use Ready** | Hardened kernel, air-gap capable, with integrated encrypted mesh networking. |
 
-Metric	Data
-Total Size	Over 7 GB of data, including source, binaries, graphics, and NIST test vectors
+---
 
-Total Files	~5,800 files
+## 🧩 Architecture & Subsystems
 
-Organization	Over 1,000 folders, representing distinct functional modules
+The kernel is organized into distinct functional modules, each with a clear responsibility. The table below details the maturity of each subsystem in the current public build.
 
-Functional Domains	Over 20 major sectors covered, from defense and finance to healthcare and energy
+### Core Kernel
 
-Primary Language	~90% Rust, with additional components in Python, Shell, and C
+| Subsystem | Status | Description |
+| :--- | :---: | :--- |
+| GDT / IDT | ✅ | Global/interrupt descriptor tables, 256 interrupt vectors |
+| Memory Management | ✅ | PMM, VMM, frame allocator, buddy, slab, mmap/shm |
+| SMP / APIC / IOMMU | ✅ | Multi-core support, APIC timer, interrupt routing, DMA isolation |
+| Scheduler | ✅ | EDF real-time + CFS, priority inheritance, work queues |
+| Fork / Exec / ELF Loader | ✅ | Process creation, ELF64 parsing, PIE + ASLR |
+| IPC | ✅ | Pipes, futex, epoll, message queues |
+| Signals | ✅ | POSIX signals, signal handlers, sigaltstack |
+| Syscall Table | ✅ | 32+ syscalls, seccomp enforcement, IONA-specific extensions |
 
-About the Founder
-Eric Bulai is the sole architect and developer of the IONA ecosystem. Over a decade of self-funded, focused execution, he has personally designed and implemented every component of the platform, from low-level kernel drivers to the high-level AI agent and blockchain protocol. His work demonstrates a rare and comprehensive mastery of the entire computing stack.
+### Filesystem
 
-Contact
-IONA is currently in a pre-release stage. Live demonstrations can be arranged for qualified strategic partners, investors, and government agencies.
+| Subsystem | Status | Description |
+| :--- | :---: | :--- |
+| IONAFS | ✅ | Custom filesystem with WAL journaling, encryption, and integrity |
+| VFS / Procfs / Devfs | ✅ | Virtual filesystem layer, /proc, /dev |
+| ext4 / FAT32 | 🟡 | Read support for external filesystems |
 
-Contact: ericbulai@gmail.com
-Website: www.iona-protocol.org
+### Networking
+
+| Subsystem | Status | Description |
+| :--- | :---: | :--- |
+| TCP / UDP Stack | ✅ | Custom network stack with IPv4/IPv6 |
+| TLS 1.3 | ✅ | ECDSA + post-quantum key exchange |
+| Mesh Networking | ✅ | Peer-to-peer mesh with onion routing |
+| WireGuard / SSH | ✅ | VPN and remote access |
+
+### Security
+
+| Subsystem | Status | Description |
+| :--- | :---: | :--- |
+| Post-Quantum Crypto | ✅ | Dilithium3, Kyber-768, SPHINCS+ (NIST vectors verified) |
+| Secure Boot | ✅ | Verified boot with Merkle tree, anti-rollback |
+| ASLR / Stack Canary | ✅ | Kernel address space layout randomization |
+| SMEP / SMAP | ✅ | Supervisor mode execution/access prevention |
+| Seccomp / Sandboxing | ✅ | Per-process syscall filtering, WASM sandbox |
+
+### IONA Protocol (Blockchain)
+
+| Subsystem | Status | Description |
+| :--- | :---: | :--- |
+| Consensus Engine | ✅ | BFT consensus with fast finality |
+| EVM | ✅ | 40+ opcodes, precompiles, state trie |
+| Governance | ✅ | On-chain voting, proposal lifecycle |
+| Validator Management | ✅ | Validator set management, slashing |
+
+### AI / ML
+
+| Subsystem | Status | Description |
+| :--- | :---: | :--- |
+| On-Device LLM | ✅ | INT4 quantized transformer, GPU-accelerated |
+| NN Compiler | ✅ | ONNX parser, RDNA2 ISA backend |
+| RAG / Whisper | ✅ | Retrieval-augmented generation, speech-to-text |
+
+### Compatibility Layer
+
+| Subsystem | Status | Description |
+| :--- | :---: | :--- |
+| Windows (.exe) | ✅ | Win32 API, GDI, threading, DLL loader |
+| Linux (ELF) | ✅ | ~300 syscalls implemented, X11 server, SDL2 port |
+| DirectX | ✅ | D3D9/10/11, DXBC→SPIR-V converter |
+| Vulkan | ✅ | Native Vulkan ICD loader |
+
+---
+
+## 📊 Project at a Glance
+
+| Metric | Data |
+| :--- | :--- |
+| **Total Size** | Over **7 GB** of data, including source, binaries, graphics, and NIST test vectors |
+| **Total Files** | **~5,800** files |
+| **Organization** | Over **1,000** folders, representing distinct functional modules |
+| **Primary Language** | ~90% Rust, with additional components in Python, Shell, and C |
+
+---
+
+## 🚀 Build & Run
+
+### Prerequisites
+- Rust nightly (see `rust-toolchain.toml`)
+- QEMU (for emulation)
+
+### Build the kernel
+```bash
+cargo build --release
+Build ISO
+bash
+./build-all.sh
+Run in QEMU
+bash
+./run_qemu.sh
+The kernel boots to a shell with 50+ subsystem tests passing.
+
+📜 License
+Apache 2.0
+
+
+
+📧 Contact
+For inquiries, demos, or partnership opportunities: ericbulai@gmail.com
+
