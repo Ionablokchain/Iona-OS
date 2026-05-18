@@ -15,17 +15,23 @@ Key Differentiators
 
 Capability                               Description
 
-Zero-Trust                                Architecture	Own kernel, own filesystem (IONAFS), own network stack. No Linux, BSD, or Windows heritage.
+Zero-Trust                                Architecture	Own kernel, own filesystem (IONAFS),
+                                          own network stack. No Linux, BSD, or Windows heritage.
 
-Post-Quantum Security by Default	        NIST-standardized algorithms (Dilithium3, Kyber-768, SPHINCS+) integrated at the system level.
+Post-Quantum Security by Default	        NIST-standardized algorithms (Dilithium3, Kyber-768,
+                                          SPHINCS+) integrated at the system level.
 
-Full Legacy Compatibility               	Runs existing Windows (.exe) and Linux (ELF) applications natively, ensuring operational continuity.
+Full Legacy Compatibility               	Runs existing Windows (.exe) and Linux (ELF) applications
+                                          natively, ensuring operational continuity.
 
-Sovereign AI	                            On-device, private AI agent using a local 7B LLM, capable of proactive system monitoring and kernel-level self-healing.
+Sovereign AI	                           On-device, private AI agent using a local 7B LLM, capable
+                                         of proactive system monitoring and kernel-level self-healing.
 
-Integrated L1 Protocol	                  Native blockchain with EVM compatibility, DAG-based consensus, and constitutional on-chain governance.
+Integrated L1 Protocol	                 Native blockchain with EVM compatibility, DAG-based consensus,
+                                         and constitutional on-chain governance.
 
-Dual-Use by Design	                     Hardened kernel, air-gap capability, and encrypted mesh networking for consumer, enterprise, and defense applications.
+Dual-Use by Design	                     Hardened kernel, air-gap capability, and encrypted mesh networking 
+                                         for consumer, enterprise, and defense applications.
 
 The Ecosystem
 IONA is composed of seven core, interconnected technologies, each a critical pillar of the larger vision.
