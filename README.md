@@ -1,68 +1,49 @@
 
 <img width="737" height="420" alt="iona os" src="https://github.com/user-attachments/assets/c86e3e48-e4c0-4946-9522-27f11175e87a" />
 
-IONA — The Sovereign Digital Ecosystem
-Not just an operating system. A complete digital civilization, built from scratch by a single founder.
+IONA — Sovereign Digital Ecosystem
+A complete, post-quantum computing platform built from scratch for strategic digital autonomy.
 
-IONA is a fully integrated, post-quantum, and sovereign computing platform. It encompasses
-a bare-metal OS kernel, a mobile OS, a Layer 1 blockchain, custom programming languages,
-and on-device AI. It's designed to be the digital foundation for a nation, an enterprise,
-or an individual who refuses to compromise on security, privacy, and strategic autonomy.
+IONA is an integrated, bare-metal operating system and Layer 1 blockchain ecosystem, architected, and implemented by a single founder. It provides a verifiably secure, fully autonomous digital infrastructure designed to eliminate dependence on foreign-controlled software and hardware supply chains.
 
-Why IONA exists: In a world of increasing digital dependency on non-European
-platforms, IONA provides a single, cohesive, and audited alternative. It's not a
-Linux distribution or a hardened Windows skin. It's a new architecture, built
-entirely from scratch in Rust, designed to eliminate entire classes of
-vulnerabilities and supply chain risks.
+Mission: To provide a single, cohesive, and audited alternative to the current digital monoculture, enabling true sovereignty for nations, critical infrastructure, and individuals.
 
-The Ecosystem
-IONA is not a single product, but a complete, integrated ecosystem of seven core
-technologies. Each repository is a pillar of a larger, coherent vision.
+Executive Summary
+IONA is not a Linux distribution or a hardened fork of an existing OS. It is a new architecture, written entirely from scratch in Rust, that integrates a memory-safe kernel, a post-quantum L1 blockchain, an autonomous AI agent, and a custom systems programming language into a single, unified platform. The project represents over a decade of focused R&D and over half a million lines of original code, entirely self-funded.
 
-Repository	Role	Description
-Iona-OS	The Fortress	A bare-metal x86_64 kernel written in Rust. Secure by design, with post-quantum cryptography and a custom filesystem.
-Iona-OS-Phone	The Mobile Bastion	A complete sovereign mobile OS (ARM64), with its own kernel, drivers, and premium UI. No Android, no Linux.
-Iona-AI	The Intelligence	An autonomous, self-healing AI agent that lives inside the OS, using a local LLM. It reasons, plans, and acts with deep OS integration.
-Iona-protocol	The Economy	A security-first L1 blockchain with EVM compatibility, on-chain governance, and post-quantum cryptography.
-Carpel	The Toolmaker	A new systems language that eliminates the ceremony of lifetimes and Pin, making safe systems programming accessible.
-Flux	The Experiment	A temporal-quantum language for a new computing paradigm, exploring the frontiers of what code can be.
--Nihilo-OS	The Philosophy	An OS without files, where mistakes are parallel universes. A radical proof-of-concept for the future of computing.
 Key Differentiators
-Built from Scratch, Not a Fork: The kernel, the filesystem, the network stack, the GUI, the AI, and the blockchain are all original work. There is zero Linux, BSD, or Windows code.
-
-Post-Quantum by Default: Dilithium3, Kyber-768, and SPHINCS+ are integrated at the system level, not bolted on as an afterthought.
-
-Full Binary Compatibility: Run your existing Windows (.exe) and Linux (ELF) applications natively on IONA OS without performance loss.
-
-On-Device, Private AI: IONA AI runs a 7B parameter LLM locally on your GPU/NPU. No cloud, no API keys, no telemetry. It can even help self-repair the kernel.
-
-Sovereign by Design: Every component is designed for user autonomy. No telemetry, no forced cloud accounts, and no foreign dependencies.
-
-Dual-Use Ready: The hardened kernel, air-gap capability, and integrated encrypted messenger make it suitable for consumer, enterprise, and government/defense applications.
-
-Architecture in Numbers
-The scope of the project is the result of over a decade of focused execution by a single architect.
+Capability	Description
+Zero-Trust Architecture	Own kernel, own filesystem (IONAFS), own network stack. No Linux, BSD, or Windows heritage.
+Post-Quantum Security by Default	NIST-standardized algorithms (Dilithium3, Kyber-768, SPHINCS+) integrated at the system level.
+Full Legacy Compatibility	Runs existing Windows (.exe) and Linux (ELF) applications natively, ensuring operational continuity.
+Sovereign AI	On-device, private AI agent using a local 7B LLM, capable of proactive system monitoring and kernel-level self-healing.
+Integrated L1 Protocol	Native blockchain with EVM compatibility, DAG-based consensus, and constitutional on-chain governance.
+Dual-Use by Design	Hardened kernel, air-gap capability, and encrypted mesh networking for consumer, enterprise, and defense applications.
+The Ecosystem
+IONA is composed of seven core, interconnected technologies, each a critical pillar of the larger vision.
 
 <img width="764" height="432" alt="test" src="https://github.com/user-attachments/assets/02914fcc-a35c-4816-9bb9-4e90b3ce07b5" />
 
+Repository	Function
+Iona-OS	The sovereign desktop kernel (x86_64), with a custom GUI, browser, and full development toolchain.
+Iona-OS-Phone	A complete sovereign mobile OS (ARM64), with native hardware drivers and a premium user interface.
+Iona-AI	The autonomous agent system with deep OS integration, self-healing capabilities, and multi-device sync.
+Iona-protocol	The security-first L1 blockchain for sovereign digital transactions and governance.
+Carpel	A new systems programming language that makes safe, low-level development accessible and productive.
+Flux	An experimental temporal-quantum language exploring the frontiers of a new computing paradigm.
+-Nihilo-OS	A radical proof-of-concept for an OS without files, built on the principles of causal probability.
+Project at a Glance
 Metric	Data
-Total Size	Over 7 GB of data, including source, binaries, graphics, and test vectors
+Total Size	Over 7 GB of data, including source, binaries, graphics, and NIST test vectors
 Total Files	~5,800 files
-Organization	Over 1,000 folders, each representing a distinct functional module
-Functional Domains	Over 20 major sectors covered, including healthcare, finance, defense, energy, and agriculture
-Language	~90% Rust, with additional components in Python, Shell, C, and Assembly
-This structure is not an experiment. It's a mature, modular architecture ready for auditing and scaling.
-
+Organization	Over 1,000 folders, representing distinct functional modules
+Functional Domains	Over 20 major sectors covered, from defense and finance to healthcare and energy
+Primary Language	~90% Rust, with additional components in Python, Shell, and C
 About the Founder
-Eric Bulai is the sole architect and developer behind the entire IONA ecosystem.
-Over the past decade, he has personally architected and implemented every component,
-from the low-level kernel drivers to the high-level AI agent and the blockchain protocol.
-The project has been entirely self-funded, demonstrating an uncompromising commitment
-to a vision of true digital sovereignty.
+Eric Bulai is the sole architect and developer of the IONA ecosystem. Over a decade of self-funded, focused execution, he has personally designed and implemented every component of the platform, from low-level kernel drivers to the high-level AI agent and blockchain protocol. His work demonstrates a rare and comprehensive mastery of the entire computing stack.
 
 Contact
-IONA is currently in a pre-release stage. A live demo can be arranged for
-serious partners, investors, or government agencies.
+IONA is currently in a pre-release stage. Live demonstrations can be arranged for qualified strategic partners, investors, and government agencies.
 
-For inquiries, demos, or partnership opportunities, contact:
-ericbulai@gmail.com
+Contact: ericbulai@gmail.com
+Website: www.iona-protocol.org
