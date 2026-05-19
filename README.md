@@ -1,3 +1,4 @@
+<img width="1280" height="720" alt="iona_screen_final" src="https://github.com/user-attachments/assets/a56cc486-b355-4b30-b1e3-f411e9b88002" />
 
 <img width="737" height="420" alt="iona os" src="https://github.com/user-attachments/assets/c86e3e48-e4c0-4946-9522-27f11175e87a" />
 
