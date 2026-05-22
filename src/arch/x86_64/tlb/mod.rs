@@ -1,78 +1,122 @@
-//! TLB shootdown — cross-core TLB invalidation via IPI
+//! TLB shootdown — cross‑core TLB invalidation via IPI
 //!
-//! Când un core modifică page tables (CoW fault, munmap, mprotect),
-//! celelalte core-uri au în TLB-ul lor intrări stale pentru paginile respective.
-//! Fără shootdown → alt core continuă să citească/scrie la adresa veche → memory corruption.
+//! When one CPU modifies the page tables (CoW fault, `munmap`, `mprotect`),
+//! other cores may still have stale TLB entries for those pages. Without a
+//! shootdown, those cores would continue using the old mapping, leading to
+//! memory corruption.
 //!
-//! Protocol:
-//!   1. Core X modifică page table + face invlpg local
-//!   2. Core X trimite IPI (vector 0x40) la toate celelalte core-uri
-//!   3. Celelalte core-uri primesc IPI → handler face invlpg pentru adresa dată
-//!   4. Core X poate continua
+//! # Protocol
+//! 1. Core X modifies the page table and performs a local `invlpg`.
+//! 2. Core X sends an IPI (vector `0x40`) to all other cores.
+//! 3. Each receiving core runs the IPI handler, which executes `invlpg` on
+//!    the given virtual address.
+//! 4. Core X waits for all acknowledgements and continues.
 //!
-//! Vector IPI: 0x40 (IDT[64]) — dedicat TLB shootdown
-//! Adresa de invalidat: stocată în TLB_SHOOTDOWN_ADDR atomic
+//! # IPI vector
+//! The dedicated TLB shootdown vector is `0x40` → IDT entry 64.
+//! The address to invalidate is stored in the global atomic
+//! `TLB_SHOOTDOWN_ADDR`.
 
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use crate::arch::x86_64::apic::{lapic_write, lapic_read, CPU_COUNT,
-                                   LAPIC_ICR_LO, LAPIC_ICR_HI};
+use core::hint::spin_loop;
+use crate::arch::x86_64::apic::{
+    lapic_write, lapic_read, CPU_COUNT, LAPIC_ICR_LO, LAPIC_ICR_HI
+};
 
-pub const TLB_SHOOTDOWN_VECTOR: u8 = 0x40; // IDT[64]
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
-/// Adresa virtuală de invalidat — scrisă de inițiator, citită de toate core-urile
+/// IPI vector used for TLB shootdown (IDT[64]).
+pub const TLB_SHOOTDOWN_VECTOR: u8 = 0x40;
+
+/// Destination shorthand in ICR: All Excluding Self (11b)
+const ICR_SHORTHAND_ALL_EXCLUDING_SELF: u32 = 0x000C_0000;
+/// Delivery mode: Fixed (000b)
+const ICR_DELIVERY_FIXED: u32 = 0x0000_0000;
+
+// -----------------------------------------------------------------------------
+// Global state
+// -----------------------------------------------------------------------------
+
+/// Virtual address to invalidate – written by the initiator, read by all cores.
 pub static TLB_SHOOTDOWN_ADDR: AtomicU64 = AtomicU64::new(0);
-/// Numărul de core-uri care au confirmat shootdown-ul
+/// Number of cores that have acknowledged the shootdown.
 pub static TLB_ACK_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Lock pentru serializare shootdown-uri (un singur shootdown la un moment dat)
+/// Serialisation lock – only one shootdown at a time.
 static TLB_LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Invalidează o pagină pe toate core-urile (TLB shootdown complet)
+// -----------------------------------------------------------------------------
+// Public API
+// -----------------------------------------------------------------------------
+
+/// Invalidate a single page on all cores (full TLB shootdown).
 ///
-/// Apelat după:
-/// - copy_on_write_fault() → remap pagină
-/// - munmap() → unmap pagini
-/// - mprotect() → modificare flags
+/// Must be called after:
+/// - Copy‑on‑write fault → page remapped
+/// - `munmap()` → pages unmapped
+/// - `mprotect()` → protection flags changed
+///
+/// If there is only one core, only a local `invlpg` is performed.
+///
+/// # Panics
+/// This function may spin indefinitely if an AP never responds. A timeout
+/// is enforced (10 ms) after which the function gives up and logs a warning.
 pub fn shootdown(virt_addr: u64) {
     let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as u64;
     if cpu_count <= 1 {
-        // Single-core: doar invlpg local
+        // Single core: local invalidation is enough.
         local_invlpg(virt_addr);
         return;
     }
 
-    // Obținem lock exclusiv pentru shootdown
+    // Acquire exclusive lock for this shootdown.
     while TLB_LOCK.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
-        core::hint::spin_loop();
+        spin_loop();
     }
 
-    // Scriem adresa de invalidat
+    // Write the address to invalidate.
     TLB_SHOOTDOWN_ADDR.store(virt_addr, Ordering::SeqCst);
     TLB_ACK_COUNT.store(0, Ordering::SeqCst);
 
-    // Invalidăm local
+    // Invalidate locally first.
     local_invlpg(virt_addr);
 
-    // Trimitem IPI la toate core-urile (broadcast, excluding self)
-    // ICR low: vector=0x40, delivery=Fixed, shorthand=All Excluding Self (11b)
-    lapic_write(LAPIC_ICR_HI, 0);
-    lapic_write(LAPIC_ICR_LO, 0x000C_4000 | TLB_SHOOTDOWN_VECTOR as u32);
-    //                          ^^^^ All Excl Self | Fixed delivery | vector
+    // Send IPI to all other cores (broadcast, excluding self).
+    // ICR low: vector = 0x40, delivery = Fixed, shorthand = All Excluding Self.
+    unsafe {
+        lapic_write(LAPIC_ICR_HI, 0);
+        lapic_write(
+            LAPIC_ICR_LO,
+            ICR_SHORTHAND_ALL_EXCLUDING_SELF
+                | ICR_DELIVERY_FIXED
+                | (TLB_SHOOTDOWN_VECTOR as u32)
+        );
+    }
 
-    // Așteptăm confirmarea de la toate AP-urile
+    // Wait for acknowledgements from all APs.
     let expected = cpu_count - 1;
-    let deadline = crate::arch::x86_64::timer::uptime_ms() + 10; // 10ms max
+    let deadline = crate::arch::x86_64::timer::uptime_ms() + 10; // 10 ms timeout
     while TLB_ACK_COUNT.load(Ordering::SeqCst) < expected {
         if crate::arch::x86_64::timer::uptime_ms() > deadline {
-            crate::serial_println!("[TLB] shootdown timeout after 10ms");
+            crate::serial_println!(
+                "[TLB] shootdown timeout after 10 ms (got {}/{})",
+                TLB_ACK_COUNT.load(Ordering::SeqCst),
+                expected
+            );
             break;
         }
-        core::hint::spin_loop();
+        spin_loop();
     }
 
     TLB_LOCK.store(false, Ordering::SeqCst);
 }
 
-/// Shootdown pentru un range de pagini [start, start + size)
+/// Invalidate a range of pages `[start, start + size)`.
+///
+/// # Arguments
+/// * `start` – Start virtual address (page‑aligned recommended).
+/// * `size` – Size in bytes (may be unaligned; the function rounds up).
 pub fn shootdown_range(start: u64, size: u64) {
     let pages = (size + 4095) / 4096;
     for i in 0..pages {
@@ -80,16 +124,19 @@ pub fn shootdown_range(start: u64, size: u64) {
     }
 }
 
-/// Handler apelat pe AP la primirea IPI TLB shootdown
-/// Apelat din IDT[64] handler (extern "x86-interrupt")
-pub fn shootdown_handler() {
+/// Handler called on each AP when it receives a TLB shootdown IPI.
+/// Must be installed in the IDT at vector `TLB_SHOOTDOWN_VECTOR`.
+///
+/// # Safety
+/// Called from an interrupt context. Must send EOI afterwards.
+pub extern "x86-interrupt" fn shootdown_handler() {
     let addr = TLB_SHOOTDOWN_ADDR.load(Ordering::SeqCst);
     local_invlpg(addr);
     TLB_ACK_COUNT.fetch_add(1, Ordering::SeqCst);
-    crate::arch::x86_64::apic::lapic_eoi();
+    unsafe { crate::arch::x86_64::apic::lapic_eoi(); }
 }
 
-/// Invalidează o singură pagină în TLB-ul core-ului curent
+/// Invalidate a single page in the current CPU’s TLB.
 #[inline(always)]
 pub fn local_invlpg(virt_addr: u64) {
     unsafe {
@@ -101,7 +148,7 @@ pub fn local_invlpg(virt_addr: u64) {
     }
 }
 
-/// Flush complet TLB (reîncarcă CR3)
+/// Flush the entire TLB by reloading `CR3`.
 #[inline(always)]
 pub fn flush_all() {
     unsafe {
