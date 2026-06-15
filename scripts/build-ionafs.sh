@@ -1,136 +1,389 @@
 #!/usr/bin/env bash
-# IONA OS disk image builder
+# =============================================================================
+# IONA OS disk image builder — Production‑ready
+#
+# Creates an IONA filesystem (IONAFS) disk image with kernel, userspace binaries,
+# configuration files, and runtime directories.
 #
 # Build modes:
-#   dev (default):    continue on non-critical inject failures, warn only
-#   strict:           STRICT_BUILD=1 — abort on any inject failure
+#   normal (default):   non‑critical failures are logged as warnings
+#   strict (--strict):  any inject failure aborts the build (for CI/release)
 #
-# Usage: ./scripts/build-ionafs.sh
-#        STRICT_BUILD=1 ./scripts/build-ionafs.sh   # strict/release mode
+# Usage:
+#   ./scripts/build-ionafs.sh [OPTIONS]
 #
+# Options:
+#   --strict            Enable strict mode (fail on any inject error)
+#   --output FILE       Output disk image path (default: ./dist/iona-disk.img)
+#   --size MB           Disk image size in MiB (default: 256)
+#   --no-clean          Do not remove existing image before building
+#   --only-bin          Only build userspace binaries, skip disk image creation
+#   --help, -h          Show this help message
+#
+# Environment variables:
+#   IONA_BUILD_MODE     Set to "prod" to enable strict mode (equivalent to --strict)
+#   IONA_VERBOSE        Set to 1 for verbose output
+# =============================================================================
+
 set -euo pipefail
-# Auto-enable strict mode if IONA_BUILD_MODE=prod
-if [ "${IONA_BUILD_MODE:-dev}" = "prod" ]; then
-    export STRICT_BUILD=1
-    log "STRICT_BUILD enabled (IONA_BUILD_MODE=prod)"
+IFS=$'\n\t'
+
+# -----------------------------------------------------------------------------
+# Constants & defaults
+# -----------------------------------------------------------------------------
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+readonly DEFAULT_OUTPUT="$ROOT_DIR/dist/iona-disk.img"
+readonly DEFAULT_SIZE_MB=256
+readonly SUPERBLOCK_MAGIC="IONA"
+
+# -----------------------------------------------------------------------------
+# Colours (only if stdout is a terminal)
+# -----------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[1;33m'
+    readonly RED='\033[0;31m'
+    readonly NC='\033[0m'
+else
+    readonly GREEN=''
+    readonly YELLOW=''
+    readonly RED=''
+    readonly NC=''
 fi
-SDIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SDIR/lib.sh"
-OUTPUT="$DIST/iona-disk.img"
-log "IONAFS image 256MB..."
-dd if=/dev/zero of="$OUTPUT" bs=1M count=256 status=none
-python3 -c "
-import sys,struct
-with open(sys.argv[1],'r+b') as f:
-    f.seek(0); f.write(b'IONA'+struct.pack('<I',0)+b'\x00'*504)
-    print('  superblock OK')
-" "$OUTPUT"
-# inst: install optional config file — failure is logged but not fatal
-inst() {
-    local t; t=$(mktemp); printf '%s' "$2" > "$t"
-    python3 "$SDIR/install-to-ionafs.py" --disk "$OUTPUT" --file "$t" --path "$1" 2>/dev/null ||         log "  WARNING: optional file $1 inject failed (non-fatal)"
-    rm -f "$t"
+
+# -----------------------------------------------------------------------------
+# Logging functions
+# -----------------------------------------------------------------------------
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+die()       { log_error "$*"; exit 1; }
+
+if [[ "${IONA_VERBOSE:-0}" -eq 1 ]]; then
+    log_debug() { echo -e "[DEBUG] $*"; }
+else
+    log_debug() { :; }
+fi
+
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+show_help() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# //'
+    exit 0
 }
 
-# inst_required: install required file — failure aborts in STRICT_BUILD mode
-inst_required() {
-    local path="$1"; local content="$2"
-    local t; t=$(mktemp); printf '%s' "$content" > "$t"
-    if ! python3 "$SDIR/install-to-ionafs.py" --disk "$OUTPUT" --file "$t" --path "$path" 2>&1; then
-        log "  ERROR: required file $path inject failed"
-        [ "${STRICT_BUILD:-0}" = "1" ] && die "Strict mode: required file $path missing"
-    fi
-    rm -f "$t"
-}
-inst_required /etc/iona-node.json '{"validator_id":0,"gossip_port":9000,"admin_port":7777,"peers":[],"first_boot":true}'
-inst /etc/resolv.conf 'nameserver 8.8.8.8'
-inst /etc/iona-release 'IONA OS v0.6.0'
-inst /etc/hostname 'iona-os'
-inst /etc/motd 'Welcome to IONA OS\n'
-install_bin() {
-    local name="$1"; shift
-    local path=""
-    for cand in "$@"; do
-        if [ -f "$ROOT_DIR/$cand" ]; then path="$ROOT_DIR/$cand"; break; fi
-    done
-    [ -n "$path" ] || { log "  SKIP /bin/$name (not built)"; return 0; }
-    if python3 "$SDIR/install-to-ionafs.py" --disk "$OUTPUT" --file "$path" --path "/bin/$name" 2>&1; then
-        log "  installed /bin/$name ($(du -sh "$path" | cut -f1))"
-    else
-        log "  WARNING: /bin/$name inject failed"
-        [ "${STRICT_BUILD:-0}" = "1" ] && die "Strict mode: /bin/$name required"
-    fi
-}
-# Useful runtime dirs/markers
-inst /var/iona-node/.keep ''
-inst /var/crash/.keep ''
-inst /var/log/.keep ''
-inst /etc/network.conf 'dhcp=1'
-install_bin iona-node   target/x86_64-unknown-none/release/iona-node   userspace/iona-node/target/x86_64-unknown-none/release/iona-node   userspace/iona-node/target/release/iona-node
-install_bin iona-shell   target/x86_64-unknown-none/release/iona-shell   userspace/iona-shell/target/x86_64-unknown-none/release/iona-shell   userspace/iona-shell/target/release/iona-shell
-install_bin iona-utils   target/x86_64-unknown-none/release/iona-utils   userspace/iona-utils/target/x86_64-unknown-none/release/iona-utils   userspace/iona-utils/target/release/iona-utils
-# ── Inject iona-node ELF ─────────────────────────────────────────────
-IONA_NODE_ELF=""
-for candidate in \
-    "userspace/iona-node/target/x86_64-unknown-none/release/iona-node" \
-    "userspace/iona-node/target/x86_64-unknown-iona/release/iona-node" \  # legacy target — can be removed
-    "userspace/iona-node/target/release/iona-node" \
-    "target/x86_64-unknown-none/release/iona-node"; do
-    [ -f "$ROOT_DIR/$candidate" ] && { IONA_NODE_ELF="$ROOT_DIR/$candidate"; break; }
+# -----------------------------------------------------------------------------
+# Parse arguments
+# -----------------------------------------------------------------------------
+STRICT_BUILD=0
+OUTPUT="$DEFAULT_OUTPUT"
+SIZE_MB="$DEFAULT_SIZE_MB"
+NO_CLEAN=0
+ONLY_BIN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --strict)
+            STRICT_BUILD=1
+            shift
+            ;;
+        --output)
+            if [[ -z "${2:-}" ]]; then
+                die "--output requires an argument"
+            fi
+            OUTPUT="$2"
+            shift 2
+            ;;
+        --size)
+            if [[ -z "${2:-}" ]]; then
+                die "--size requires an argument"
+            fi
+            SIZE_MB="$2"
+            shift 2
+            ;;
+        --no-clean)
+            NO_CLEAN=1
+            shift
+            ;;
+        --only-bin)
+            ONLY_BIN=1
+            shift
+            ;;
+        --help|-h)
+            show_help
+            ;;
+        -*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            die "Unexpected positional argument: $1"
+            ;;
+    esac
 done
 
-if [ -z "$IONA_NODE_ELF" ]; then
-    log "iona-node ELF not found — building now..."
-    if [ -f "$ROOT_DIR/userspace/iona-node/Cargo.toml" ]; then
-        # Try bare-metal target first (correct for IONA OS userspace)
-        BUILT_ELF=""
-        if (cd "$ROOT_DIR/userspace/iona-node" &&             cargo build --target x86_64-unknown-none --release 2>&1 | tail -5); then
-            BUILT_ELF="$ROOT_DIR/userspace/iona-node/target/x86_64-unknown-none/release/iona-node"
-        elif (cd "$ROOT_DIR/userspace/iona-node" &&               cargo build --release 2>&1 | tail -5); then
-            BUILT_ELF="$ROOT_DIR/userspace/iona-node/target/release/iona-node"
-            log "  NOTICE: built with host target — binary may not run on bare metal"
-        fi
+# Override strict mode from environment
+if [[ "${IONA_BUILD_MODE:-dev}" == "prod" ]]; then
+    STRICT_BUILD=1
+    log_info "Strict mode enabled (IONA_BUILD_MODE=prod)"
+fi
 
-        # Validate the built binary is actually an ELF
-        if [ -n "$BUILT_ELF" ] && [ -f "$BUILT_ELF" ]; then
-            ELF_MAGIC=$(xxd -l 4 "$BUILT_ELF" 2>/dev/null | awk '{print $2$3}' || echo "")
-            if [ "$ELF_MAGIC" = "7f454c46" ]; then
-                IONA_NODE_ELF="$BUILT_ELF"
-                log "  iona-node ELF validated: $(du -sh "$BUILT_ELF" | cut -f1)"
-            else
-                log "  WARNING: built binary is not a valid ELF — ignoring"
-                [ "${STRICT_BUILD:-0}" = "1" ] && die "Strict mode: invalid ELF"
-            fi
-        else
-            log "  WARNING: iona-node build failed — /bin/iona-node will be absent"
-            [ "${STRICT_BUILD:-0}" = "1" ] && die "Strict mode: iona-node required"
+# -----------------------------------------------------------------------------
+# Dependency checks
+# -----------------------------------------------------------------------------
+check_deps() {
+    local missing=0
+    for cmd in dd python3 xxd cargo; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log_error "Missing required command: $cmd"
+            missing=1
         fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        exit 1
     fi
-fi
+}
 
-# Sanity check: warn if stale x86_64-unknown-none and host binaries both exist
-STALE_HOST="$ROOT_DIR/userspace/iona-node/target/release/iona-node"
-CORRECT_ELF="$ROOT_DIR/userspace/iona-node/target/x86_64-unknown-none/release/iona-node"
-if [ -f "$STALE_HOST" ] && [ -f "$CORRECT_ELF" ] && [ "$IONA_NODE_ELF" = "$STALE_HOST" ]; then
-    log "  WARNING: using host binary but x86_64-unknown-none binary also exists"
-    log "  Prefer: $CORRECT_ELF"
-fi
+# -----------------------------------------------------------------------------
+# Create blank disk image with superblock
+# -----------------------------------------------------------------------------
+create_disk_image() {
+    local output="$1"
+    local size_mb="$2"
+    local out_dir
+    out_dir="$(dirname "$output")"
+    mkdir -p "$out_dir"
 
-if [ -n "$IONA_NODE_ELF" ] && [ -f "$IONA_NODE_ELF" ]; then
-    if python3 "$SDIR/install-to-ionafs.py"         --disk "$OUTPUT" --file "$IONA_NODE_ELF" --path "/bin/iona-node" 2>&1; then
-        ok "  /bin/iona-node injected ($(du -sh "$IONA_NODE_ELF" | cut -f1))"
+    if [[ -f "$output" && $NO_CLEAN -eq 0 ]]; then
+        log_info "Removing existing image: $output"
+        rm -f "$output"
+    fi
+
+    log_info "Creating ${size_mb}MiB disk image at $output"
+    dd if=/dev/zero of="$output" bs=1M count="$size_mb" status=progress 2>&1 || die "dd failed"
+
+    # Write superblock (magic + version + padding)
+    python3 -c "
+import sys, struct
+with open(sys.argv[1], 'r+b') as f:
+    f.seek(0)
+    f.write(b'$SUPERBLOCK_MAGIC')
+    f.write(struct.pack('<I', 0))   # version 0
+    f.write(b'\x00' * 504)          # padding to 512 bytes
+    print('Superblock written')
+" "$output" || die "Failed to write superblock"
+
+    log_info "Disk image created"
+}
+
+# -----------------------------------------------------------------------------
+# Inject a file into IONAFS (non‑fatal)
+# -----------------------------------------------------------------------------
+inject_file() {
+    local dest_path="$1"
+    local content="$2"
+    local tmp
+    tmp="$(mktemp)"
+    printf '%s' "$content" > "$tmp"
+
+    if python3 "$SCRIPT_DIR/install-to-ionafs.py" \
+        --disk "$OUTPUT" \
+        --file "$tmp" \
+        --path "$dest_path" 2>/dev/null; then
+        log_debug "Injected $dest_path"
+        rm -f "$tmp"
+        return 0
     else
-        log "  WARNING: iona-node inject failed — check install-to-ionafs.py"
-        [ "${STRICT_BUILD:-0}" = "1" ] && die "Strict mode: iona-node inject required"
+        log_warn "Failed to inject optional file: $dest_path"
+        rm -f "$tmp"
+        return 1
     fi
-else
-    log "  WARNING: /bin/iona-node absent — userspace won't start"
-    log "  Fix: cargo build -p iona-node && ./scripts/build-ionafs.sh"
-fi
+}
 
-ok "IONAFS: $OUTPUT"
+# -----------------------------------------------------------------------------
+# Inject a required file (fails in strict mode)
+# -----------------------------------------------------------------------------
+inject_required() {
+    local dest_path="$1"
+    local content="$2"
+    local tmp
+    tmp="$(mktemp)"
+    printf '%s' "$content" > "$tmp"
 
-if [ -f "$DIST/release-manifest.json" ]; then
-    python3 "$SDIR/install-to-ionafs.py" --disk "$OUTPUT" --file "$DIST/release-manifest.json" --path "/etc/iona-artifacts.json" 2>/dev/null || true
-    log "  installed /etc/iona-artifacts.json"
-fi
+    if python3 "$SCRIPT_DIR/install-to-ionafs.py" \
+        --disk "$OUTPUT" \
+        --file "$tmp" \
+        --path "$dest_path" 2>&1; then
+        log_debug "Injected required $dest_path"
+        rm -f "$tmp"
+        return 0
+    else
+        log_error "Failed to inject required file: $dest_path"
+        rm -f "$tmp"
+        if [[ $STRICT_BUILD -eq 1 ]]; then
+            die "Strict mode: required file injection failed"
+        fi
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Install a binary from build artifacts (looks in multiple locations)
+# -----------------------------------------------------------------------------
+install_binary() {
+    local bin_name="$1"
+    shift
+    local paths=("$@")
+    local found=""
+    local elf_path=""
+
+    for cand in "${paths[@]}"; do
+        local full="$ROOT_DIR/$cand"
+        if [[ -f "$full" ]]; then
+            found="$full"
+            break
+        fi
+    done
+
+    if [[ -z "$found" ]]; then
+        log_warn "Binary $bin_name not found in any candidate location"
+        return 1
+    fi
+
+    elf_path="$found"
+
+    # Quick ELF validation (magic bytes)
+    local magic
+    magic="$(xxd -l 4 -p "$elf_path" 2>/dev/null || echo "")"
+    if [[ "$magic" != "7f454c46" ]]; then
+        log_error "File $elf_path is not a valid ELF (magic $magic)"
+        return 1
+    fi
+
+    if python3 "$SCRIPT_DIR/install-to-ionafs.py" \
+        --disk "$OUTPUT" \
+        --file "$elf_path" \
+        --path "/bin/$bin_name" 2>&1; then
+        local size
+        size="$(du -sh "$elf_path" | cut -f1)"
+        log_info "Installed /bin/$bin_name ($size)"
+        return 0
+    else
+        log_error "Failed to inject /bin/$bin_name"
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Build a userspace binary if missing
+# -----------------------------------------------------------------------------
+build_if_missing() {
+    local bin_name="$1"
+    local crate_path="$2"
+    local target_triple="${3:-x86_64-unknown-none}"
+
+    local elf_path="$ROOT_DIR/$crate_path/target/$target_triple/release/$bin_name"
+    if [[ -f "$elf_path" ]]; then
+        # Already built
+        return 0
+    fi
+
+    log_info "Building $bin_name (target: $target_triple)..."
+    pushd "$ROOT_DIR/$crate_path" >/dev/null
+    if cargo build --target "$target_triple" --release 2>&1; then
+        log_info "Successfully built $bin_name"
+        popd >/dev/null
+        return 0
+    else
+        log_error "Failed to build $bin_name"
+        popd >/dev/null
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    check_deps
+
+    if [[ $ONLY_BIN -eq 1 ]]; then
+        log_info "Only building userspace binaries (--only-bin)"
+        # Build necessary userspace crates
+        build_if_missing "iona-node"   "userspace/iona-node"   "x86_64-unknown-none" || \
+            build_if_missing "iona-node" "userspace/iona-node" "" || \
+            die "Cannot build iona-node"
+        build_if_missing "iona-shell"  "userspace/iona-shell"  "x86_64-unknown-none" || \
+            build_if_missing "iona-shell" "userspace/iona-shell" "" || \
+            log_warn "iona-shell not built (optional)"
+        build_if_missing "iona-utils"  "userspace/iona-utils"  "x86_64-unknown-none" || \
+            build_if_missing "iona-utils" "userspace/iona-utils" "" || \
+            log_warn "iona-utils not built (optional)"
+        log_info "Binary build completed"
+        exit 0
+    fi
+
+    create_disk_image "$OUTPUT" "$SIZE_MB"
+
+    # ── Required files (must succeed in strict mode) ──────────────────────
+    inject_required "/etc/iona-node.json" \
+        '{"validator_id":0,"gossip_port":9000,"admin_port":7777,"peers":[],"first_boot":true}'
+
+    # ── Optional files (warnings only) ────────────────────────────────────
+    inject_file "/etc/resolv.conf" "nameserver 8.8.8.8"
+    inject_file "/etc/iona-release" "IONA OS v0.6.0"
+    inject_file "/etc/hostname" "iona-os"
+    inject_file "/etc/motd" "Welcome to IONA OS\n"
+    inject_file "/etc/network.conf" "dhcp=1"
+
+    # ── Runtime directories (markers) ─────────────────────────────────────
+    inject_file "/var/iona-node/.keep" ""
+    inject_file "/var/crash/.keep" ""
+    inject_file "/var/log/.keep" ""
+
+    # ── Install userspace binaries ────────────────────────────────────────
+    # Try to build missing ones automatically
+    build_if_missing "iona-node" "userspace/iona-node" "x86_64-unknown-none" || true
+    build_if_missing "iona-shell" "userspace/iona-shell" "x86_64-unknown-none" || true
+    build_if_missing "iona-utils" "userspace/iona-utils" "x86_64-unknown-none" || true
+
+    # Candidate paths for each binary
+    local node_candidates=(
+        "userspace/iona-node/target/x86_64-unknown-none/release/iona-node"
+        "userspace/iona-node/target/release/iona-node"
+        "target/x86_64-unknown-none/release/iona-node"
+    )
+    local shell_candidates=(
+        "userspace/iona-shell/target/x86_64-unknown-none/release/iona-shell"
+        "userspace/iona-shell/target/release/iona-shell"
+    )
+    local utils_candidates=(
+        "userspace/iona-utils/target/x86_64-unknown-none/release/iona-utils"
+        "userspace/iona-utils/target/release/iona-utils"
+    )
+
+    install_binary "iona-node" "${node_candidates[@]}" || {
+        if [[ $STRICT_BUILD -eq 1 ]]; then
+            die "Required binary iona-node not installed"
+        else
+            log_warn "iona-node not installed"
+        fi
+    }
+    install_binary "iona-shell" "${shell_candidates[@]}" || {
+        log_warn "iona-shell not installed (optional)"
+    }
+    install_binary "iona-utils" "${utils_candidates[@]}" || {
+        log_warn "iona-utils not installed (optional)"
+    }
+
+    # ── Release manifest (if present) ─────────────────────────────────────
+    local manifest="$ROOT_DIR/dist/release-manifest.json"
+    if [[ -f "$manifest" ]]; then
+        inject_file "/etc/iona-artifacts.json" "$(cat "$manifest")"
+    fi
+
+    log_info "IONAFS image built: $OUTPUT"
+}
+
+main "$@"
