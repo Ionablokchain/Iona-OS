@@ -1,20 +1,20 @@
 # IONA OS Recovery
 
 ## Recovery boot
-Adaugă `recovery=1` la cmdline GRUB:
-  multiboot2 /boot/iona-os-kernel.elf recovery=1
+Add `recovery=1` to GRUB cmdline:
+multiboot2 /boot/iona-os-kernel.elf recovery=1
 
-Kernelul detectează flagul și pornește în recovery shell
-(terminal minimal, fără GUI, fără node).
+Kernel detects flag and boots into recovery shell
+(minimal terminal, no GUI, no node).
 
 ## Rollback
-  ./scripts/update.sh --rollback
+./scripts/update.sh --rollback
 
-Restaurează ultimul backup din backup/*.zip.
+Restore last backup from backup/*.zip.
 
 ## Kernel panic recovery
-La panic: ecranul arată BSOD cu mesajul de eroare.
-Reboot automat după 30s dacă reboot_on_panic=1 în config.
+On panic: screen shows BSOD with error message.
+Automatically reboot after 30s if reboot_on_panic=1 in config.
 
 ## Factory reset
-Șterge /etc/iona-os-firstboot.done și restartează firstboot wizard.
+Delete /etc/iona-os-firstboot.done and restart firstboot wizard.
