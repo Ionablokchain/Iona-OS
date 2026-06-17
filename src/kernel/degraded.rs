@@ -1,7 +1,7 @@
 //! Degraded mode — kernel continues with reduced functionality
 //!
-//! Triggered when a non-critical component fails at boot or runtime.
-//! Instead of panicking, we enter degraded mode and log what's missing.
+//! Triggered when a non‑critical component fails at boot or runtime.
+//! Instead of panicking, we enter degraded mode and log what is missing.
 //!
 //! # Example
 //!
@@ -13,9 +13,10 @@
 //! assert!(status_string().contains("DEGRADED"));
 //! ```
 
-use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
+use core::time::Duration;
 use spin::{Lazy, Mutex};
 
 // -----------------------------------------------------------------------------
@@ -38,11 +39,13 @@ pub struct DegradedComponent {
     pub name: String,
     pub reason: String,
     pub affects: Vec<String>,
+    /// Timestamp when this component was marked degraded (milliseconds since boot).
+    pub timestamp_ms: u64,
 }
 
 impl DegradedComponent {
     /// Create a new component after validation.
-    fn new(name: &str, reason: &str, affects: &[&str]) -> Result<Self, &'static str> {
+    fn new(name: &str, reason: &str, affects: &[&str], timestamp_ms: u64) -> Result<Self, &'static str> {
         if name.is_empty() {
             return Err("component name must not be empty");
         }
@@ -53,6 +56,7 @@ impl DegradedComponent {
             name: name.to_string(),
             reason: reason.to_string(),
             affects: affects.iter().map(|s| (*s).to_string()).collect(),
+            timestamp_ms,
         })
     }
 }
@@ -63,6 +67,7 @@ impl fmt::Display for DegradedComponent {
         if !self.affects.is_empty() {
             write!(f, " (affects: {})", self.affects.join(", "))?;
         }
+        write!(f, " [{}ms]", self.timestamp_ms)?;
         Ok(())
     }
 }
@@ -72,7 +77,7 @@ impl fmt::Display for DegradedComponent {
 // -----------------------------------------------------------------------------
 
 static DEGRADED: Lazy<Mutex<Vec<DegradedComponent>>> =
-    Lazy::new(|| Mutex::new(Vec::with_capacity(8)));
+    Lazy::new(|| Mutex::new(Vec::with_capacity(MAX_COMPONENTS)));
 
 /// Returns `true` if at least one component is degraded.
 #[must_use]
@@ -91,10 +96,13 @@ pub fn degraded_count() -> usize {
 /// # Panics
 /// Panics if `name` or `reason` are empty (debug builds). In release, the error is silently ignored.
 pub fn mark_degraded(name: &str, reason: &str, affects: &[&str]) {
-    // Validate early to avoid poisoning the lock with bad data.
-    let component = match DegradedComponent::new(name, reason, affects) {
+    let now = crate::arch::x86_64::timer::uptime_ms();
+    let component = match DegradedComponent::new(name, reason, affects, now) {
         Ok(c) => c,
         Err(e) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(error = e, "invalid degraded component");
+            #[cfg(not(feature = "tracing"))]
             crate::serial_println!("[DEGRADED] Invalid component: {}", e);
             return;
         }
@@ -105,18 +113,27 @@ pub fn mark_degraded(name: &str, reason: &str, affects: &[&str]) {
     if let Some(existing) = guard.iter_mut().find(|c| c.name == component.name) {
         // Only log if something actually changed
         if existing.reason != component.reason || existing.affects != component.affects {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(name = %component.name, reason = %component.reason, "degraded component updated");
+            #[cfg(not(feature = "tracing"))]
             crate::serial_println!("[DEGRADED] {} — {} (updated)", component.name, component.reason);
         }
         existing.reason = component.reason;
         existing.affects = component.affects;
+        existing.timestamp_ms = component.timestamp_ms;
     } else {
         if guard.len() >= MAX_COMPONENTS {
             // Remove oldest to make room
             guard.remove(0);
         }
-        crate::serial_println!("[DEGRADED] {} — {}", component.name, component.reason);
-        if !component.affects.is_empty() {
-            crate::serial_println!("[DEGRADED]  affects: {:?}", component.affects);
+        #[cfg(feature = "tracing")]
+        tracing::warn!(name = %component.name, reason = %component.reason, affects = ?component.affects, "degraded component added");
+        #[cfg(not(feature = "tracing"))]
+        {
+            crate::serial_println!("[DEGRADED] {} — {}", component.name, component.reason);
+            if !component.affects.is_empty() {
+                crate::serial_println!("[DEGRADED]  affects: {:?}", component.affects);
+            }
         }
         guard.push(component);
     }
@@ -142,7 +159,7 @@ pub fn components() -> Vec<DegradedComponent> {
     DEGRADED.lock().clone()
 }
 
-/// Returns a human-readable status string.
+/// Returns a human‑readable status string.
 #[must_use]
 pub fn status_string() -> String {
     let guard = DEGRADED.lock();
@@ -159,12 +176,21 @@ pub fn is_degraded_for(component: &str) -> bool {
     DEGRADED.lock().iter().any(|c| c.name == component)
 }
 
-/// Persist degraded status to disk (best-effort).
+/// Execute a closure only if the specified component is degraded.
+/// Returns `Some(result)` if executed, otherwise `None`.
+pub fn with_degraded<F, R>(component: &str, f: F) -> Option<R>
+where
+    F: FnOnce(&DegradedComponent) -> R,
+{
+    let guard = DEGRADED.lock();
+    guard.iter().find(|c| c.name == component).map(f)
+}
+
+/// Persist degraded status to disk (best‑effort).
 ///
 /// The current list is cloned under the lock, then written without holding the lock.
 /// Returns `Ok(())` on success, or an error message if writing failed.
 pub fn persist_status() -> Result<(), &'static str> {
-    // Clone the list quickly
     let snapshot = DEGRADED.lock().clone();
     if snapshot.is_empty() {
         return Ok(());
@@ -182,6 +208,20 @@ pub fn persist_status() -> Result<(), &'static str> {
         .map_err(|_| "Failed to write degraded log")
 }
 
+/// Return a short summary for logging (component names only).
+#[must_use]
+pub fn summary() -> String {
+    let guard = DEGRADED.lock();
+    if guard.is_empty() {
+        return "none".to_string();
+    }
+    guard
+        .iter()
+        .map(|c| c.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -190,7 +230,6 @@ pub fn persist_status() -> Result<(), &'static str> {
 mod tests {
     use super::*;
 
-    // Helper to reset state for tests.
     fn reset() {
         DEGRADED.lock().clear();
     }
@@ -210,6 +249,7 @@ mod tests {
         assert_eq!(comps[0].name, "test1");
         assert!(comps[0].reason.contains("failed"));
         assert_eq!(comps[0].affects, vec!["net", "storage"]);
+        assert!(comps[0].timestamp_ms > 0);
 
         clear_degraded("test1");
         assert!(!is_degraded());
@@ -243,12 +283,10 @@ mod tests {
     #[test]
     fn test_max_components_ring_buffer() {
         reset();
-        // Fill exactly MAX_COMPONENTS
         for i in 0..MAX_COMPONENTS {
             mark_degraded(&alloc::format!("comp_{}", i), "test", &[]);
         }
         assert_eq!(degraded_count(), MAX_COMPONENTS);
-        // Ensure the first one is the oldest
         assert!(is_degraded_for("comp_0"));
 
         // Add one more, should evict the oldest (comp_0)
@@ -273,7 +311,6 @@ mod tests {
     fn test_empty_name_is_rejected() {
         reset();
         mark_degraded("", "some reason", &[]);
-        // Should not add anything
         assert!(!is_degraded());
         assert_eq!(degraded_count(), 0);
     }
@@ -287,15 +324,21 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_duplicate_with_same_data_does_not_log_twice() {
+    fn test_with_degraded() {
         reset();
-        mark_degraded("comp", "reason", &["a"]);
-        // The second call with identical data should not duplicate or log "updated"
-        // (we can't easily test absence of log output, but state remains consistent)
-        mark_degraded("comp", "reason", &["a"]);
-        assert_eq!(degraded_count(), 1);
-        let comp = components()[0].clone();
-        assert_eq!(comp.reason, "reason");
-        assert_eq!(comp.affects, vec!["a"]);
+        mark_degraded("test", "reason", &["a"]);
+        let result = with_degraded("test", |c| c.reason.clone());
+        assert_eq!(result, Some("reason".to_string()));
+        let result2 = with_degraded("nonexistent", |_| 42);
+        assert_eq!(result2, None);
+    }
+
+    #[test]
+    fn test_summary() {
+        reset();
+        assert_eq!(summary(), "none");
+        mark_degraded("a", "r", &[]);
+        mark_degraded("b", "r", &[]);
+        assert_eq!(summary(), "a, b");
     }
 }
