@@ -1,139 +1,280 @@
-//! Cryptographic primitives for consensus: signing and verification.
+//! Cryptographic primitives for IONA consensus and networking.
 //!
-//! **Production**: Use real implementations (e.g., `src/security/hsm.rs`).
-//! **Development / testing only**: This module provides an ECDSA P‑256 signer
-//! that stores private keys in memory and is **never** compiled in release builds.
+//! This module provides:
 //!
-//! ⚠️ **WARNING**: This code is only active when the `dev-signing` feature is enabled.
-//! It is **not** suitable for production use.
+//! - **Core traits**: `Signer` and `Verifier` for pluggable signing backends.
+//! - **Ed25519 implementation**: Production‑grade signing using `ed25519_dalek`.
+//! - **Remote signer client**: HTTP‑based signing service with mTLS and retries.
+//! - **HSM abstraction**: Support for PKCS#11, AWS KMS, Azure Key Vault, GCP Cloud KMS.
+//! - **Development signer**: In‑memory ECDSA P‑256 for testing (feature‑gated).
+//! - **Keystore**: Encrypted storage for private keys.
+//! - **Transaction signing**: Utilities for signing and verifying transactions.
+//!
+//! # Security Notes
+//!
+//! - The Ed25519 implementation uses constant‑time operations and zeroizes secrets.
+//! - The remote signer client supports mTLS and API key authentication.
+//! - The HSM abstraction is designed for production use with hardware security modules.
+//! - The development signer is **only** available with the `dev-signing` feature.
+//!
+//! # Feature Flags
+//!
+//! - `dev-signing`: Enables the in‑memory ECDSA P‑256 signer for development/testing.
+//! - `pkcs11`: Enables PKCS#11 HSM support.
+//! - `aws-kms`: Enables AWS KMS support.
+//! - `azure-kv`: Enables Azure Key Vault support.
+//! - `gcp-kms`: Enables GCP Cloud KMS support.
+//!
+//! # Example
+//!
+//! ```
+//! use iona::crypto::{Signer, Verifier, ed25519::Ed25519Signer};
+//!
+//! let signer = Ed25519Signer::random();
+//! let pk = signer.public_key();
+//! let msg = b"hello world";
+//! let sig = signer.sign(msg);
+//! assert!(Ed25519Verifier::verify(&pk, msg, &sig).is_ok());
+//! ```
 
-use alloc::vec::Vec;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// Public key type
+// Core types
 // -----------------------------------------------------------------------------
 
-/// 32‑byte compressed public key representation (first byte is `0x02` or `0x03`).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord,
-         serde::Serialize, serde::Deserialize)]
+/// Public key bytes wrapper with hex serialisation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PublicKeyBytes(pub Vec<u8>);
 
+impl std::fmt::Display for PublicKeyBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(&self.0))
+    }
+}
+
+impl std::str::FromStr for PublicKeyBytes {
+    type Err = hex::FromHexError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(PublicKeyBytes(hex::decode(s)?))
+    }
+}
+
+impl Serialize for PublicKeyBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicKeyBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        hex::decode(&s)
+            .map(PublicKeyBytes)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Signature bytes wrapper (usually 64 bytes for Ed25519).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignatureBytes(pub Vec<u8>);
+
 // -----------------------------------------------------------------------------
-// Traits
+// Error types
 // -----------------------------------------------------------------------------
 
-/// A signer capable of producing signatures for consensus messages.
+/// Cryptographic errors that can occur during signing or verification.
+#[derive(Debug, Error)]
+pub enum CryptoError {
+    /// Signature verification failed.
+    #[error("invalid signature")]
+    InvalidSignature,
+
+    /// Key‑related error (invalid format, unsupported algorithm).
+    #[error("key error: {0}")]
+    Key(String),
+
+    /// Invalid key length.
+    #[error("invalid key length: expected {expected}, got {actual}")]
+    KeyLength { expected: usize, actual: usize },
+
+    /// Invalid signature length.
+    #[error("invalid signature length: expected {expected}, got {actual}")]
+    SignatureLength { expected: usize, actual: usize },
+
+    /// Network error (for remote signer).
+    #[error("network error: {0}")]
+    Network(String),
+
+    /// Configuration error.
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    /// Timeout error.
+    #[error("operation timed out")]
+    Timeout,
+
+    /// HSM error.
+    #[error("HSM error: {0}")]
+    Hsm(String),
+
+    /// Internal error.
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+pub type CryptoResult<T> = Result<T, CryptoError>;
+
+// -----------------------------------------------------------------------------
+// Core traits
+// -----------------------------------------------------------------------------
+
+/// A signer that can produce signatures for arbitrary messages.
+///
+/// Implementations must be thread‑safe (`Send + Sync`) and can be backed
+/// by local keys, remote signing services, or hardware security modules.
 pub trait Signer: Send + Sync {
-    /// Returns the public key corresponding to this signer.
+    /// Return the public key corresponding to this signer.
     fn public_key(&self) -> PublicKeyBytes;
 
-    /// Sign a message and return the signature as a byte vector.
-    fn sign(&self, msg: &[u8]) -> Vec<u8>;
-}
-
-/// A stateless verifier for consensus signatures.
-pub trait Verifier: Send + Sync {
-    /// Verify a signature against a public key and message.
-    /// Returns `Ok(())` on success, `Err(())` on failure.
-    fn verify(pk: &PublicKeyBytes, msg: &[u8], sig: &[u8]) -> Result<(), ()>;
-}
-
-// -----------------------------------------------------------------------------
-// Development‑only ECDSA P‑256 signer
-// -----------------------------------------------------------------------------
-
-/// ECDSA P‑256 signer for testing – stores the private key in memory.
-/// Never used in production builds.
-///
-/// This signer is only available when the `dev-signing` feature is enabled
-/// (which is automatically the case for tests and development profiles).
-#[cfg(any(test, feature = "dev-signing"))]
-pub struct EcdsaSigner {
-    /// Public key (compressed, 33 bytes).
-    pub pk: PublicKeyBytes,
-    /// Private key scalar (32 bytes).
-    pub sk: [u8; 32],
-}
-
-#[cfg(any(test, feature = "dev-signing"))]
-impl EcdsaSigner {
-    /// Create a signer from a 32‑byte private key.
+    /// Sign the given message and return the signature.
     ///
-    /// The public key is derived using proper P‑256 point multiplication.
-    /// If the underlying TLS module is not available (e.g., when `tls` feature
-    /// is disabled), a dummy public key is generated (verification will fail).
-    pub fn new(sk: [u8; 32]) -> Self {
-        // Derive public key via real P‑256 base point multiplication.
-        #[cfg(feature = "tls")]
-        let pk_bytes = crate::net::tls::ecdsa::public_from_secret(&sk);
-        #[cfg(not(feature = "tls"))]
-        let pk_bytes = {
-            // Dummy public key: first byte 0x02 followed by the first 32 bytes
-            // of the Blake3 hash of the secret key.
-            // This is only for compilation when TLS is disabled; verification will fail.
-            let mut dummy = alloc::vec![0x02];
-            let hash = crate::consensus::engine::sha256_hash(&sk);
-            dummy.extend_from_slice(&hash);
-            dummy
-        };
-        Self {
-            pk: PublicKeyBytes(pk_bytes),
-            sk,
-        }
-    }
+    /// # Panics
+    /// Implementations should avoid panicking; they may return an empty
+    /// signature if signing fails (the caller must handle that case).
+    fn sign(&self, msg: &[u8]) -> SignatureBytes;
 }
 
-#[cfg(any(test, feature = "dev-signing"))]
-impl Signer for EcdsaSigner {
-    fn public_key(&self) -> PublicKeyBytes {
-        self.pk.clone()
-    }
-
-    fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        // Use deterministic RFC 6979 ECDSA P‑256 signing.
-        let hash = crate::consensus::engine::sha256_hash(msg);
-        let sig = crate::net::tls::ecdsa::p256_sign(&self.sk, &hash);
-        if sig.len() == 64 {
-            sig
-        } else {
-            // Fallback for invalid key – never reveals the private key.
-            // Return all‑zero signature; verification will fail.
-            vec![0u8; 64]
-        }
-    }
+/// A stateless verifier that can validate signatures against public keys.
+pub trait Verifier: Send + Sync {
+    /// Verify that `sig` is a valid signature for `msg` under `pk`.
+    ///
+    /// # Returns
+    /// `Ok(())` if the signature is valid, `Err(CryptoError::InvalidSignature)` otherwise.
+    fn verify(pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()>;
 }
 
 // -----------------------------------------------------------------------------
-// Development‑only ECDSA verifier
+// Submodules
 // -----------------------------------------------------------------------------
 
-/// ECDSA P‑256 verifier for testing.
-#[cfg(any(test, feature = "dev-signing"))]
-pub struct EcdsaVerifier;
+pub mod ed25519;
+pub mod tx;
+pub mod keystore;
+pub mod remote_signer;
+pub mod hsm;
 
+// Development signer (feature‑gated)
 #[cfg(any(test, feature = "dev-signing"))]
-impl Verifier for EcdsaVerifier {
-    fn verify(pk: &PublicKeyBytes, msg: &[u8], sig: &[u8]) -> Result<(), ()> {
-        if sig.len() < 64 || pk.0.len() < 33 {
-            return Err(());
-        }
-        let hash = crate::consensus::engine::sha256_hash(msg);
-        // Extract the 32‑byte public key scalar from the compressed representation.
-        let pk_scalar: [u8; 32] = pk.0[1..33].try_into().map_err(|_| ())?;
-        if crate::net::tls::ecdsa::p256_verify_raw(&pk_scalar, &hash, sig) {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
+pub mod dev;
+
+// -----------------------------------------------------------------------------
+// Re‑exports
+// -----------------------------------------------------------------------------
+
+// Ed25519 (production default)
+pub use ed25519::{Ed25519Signer, Ed25519Verifier};
+
+// Transaction signing
+pub use tx::{derive_address, sign_tx, tx_sign_bytes, verify_tx_signature};
+
+// Keystore
+pub use keystore::{
+    change_keystore_password, decrypt_seed32_from_file, encrypt_seed32_to_file,
+    keystore_exists, validate_keystore, KeystoreError, KeystoreOptions,
+};
+
+// Remote signer
+pub use remote_signer::{
+    connect_simple, RemoteSigner, RemoteSignerConfig, RemoteSignerError,
+};
+
+// HSM
+pub use hsm::{
+    create_signer, KeyBackendConfig, LocalSigner, HsmSigner,
+};
+
+// Development signer (feature‑gated)
+#[cfg(any(test, feature = "dev-signing"))]
+pub use dev::{EcdsaSigner, EcdsaVerifier};
+
+// -----------------------------------------------------------------------------
+// Factory function
+// -----------------------------------------------------------------------------
+
+/// Create a signer from a configuration.
+///
+/// This is a convenience wrapper around `hsm::create_signer`.
+pub fn create_signer(config: &KeyBackendConfig) -> CryptoResult<Box<dyn Signer>> {
+    hsm::create_signer(config).map(|s| s as Box<dyn Signer>)
 }
 
 // -----------------------------------------------------------------------------
-// Production safety guard
+// Version information
 // -----------------------------------------------------------------------------
 
-// Ensure production builds never accidentally include this module.
-#[cfg(not(any(test, feature = "dev-signing")))]
-compile_error!(
-    "The 'dev-signing' feature must be enabled for development; it is disabled in release builds."
-);
+/// Returns the crypto module version.
+pub fn module_version() -> &'static str {
+    "1.0.0"
+}
+
+/// Returns the Ed25519 implementation version.
+pub fn ed25519_version() -> &'static str {
+    ed25519_dalek::VERSION
+}
+
+// -----------------------------------------------------------------------------
+// Prelude
+// -----------------------------------------------------------------------------
+
+/// Convenience prelude for the crypto module.
+///
+/// # Example
+/// ```rust,ignore
+/// use iona::crypto::prelude::*;
+/// ```
+pub mod prelude {
+    pub use super::{
+        CryptoError, CryptoResult, PublicKeyBytes, SignatureBytes,
+        Signer, Verifier,
+        Ed25519Signer, Ed25519Verifier,
+        derive_address, sign_tx, verify_tx_signature,
+        create_signer, KeyBackendConfig,
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519::Ed25519Signer;
+
+    #[test]
+    fn test_ed25519_roundtrip() {
+        let signer = Ed25519Signer::random();
+        let pk = signer.public_key();
+        let msg = b"test message";
+        let sig = signer.sign(msg);
+        assert!(Ed25519Verifier::verify(&pk, msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn test_public_key_display() {
+        let pk = PublicKeyBytes(vec![0xAA; 32]);
+        let s = pk.to_string();
+        assert_eq!(s, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn test_public_key_serialization() {
+        let pk = PublicKeyBytes(vec![0xAA; 32]);
+        let json = serde_json::to_string(&pk).unwrap();
+        assert_eq!(json, "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"");
+        let pk2: PublicKeyBytes = serde_json::from_str(&json).unwrap();
+        assert_eq!(pk, pk2);
+    }
+}
