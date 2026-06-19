@@ -27,8 +27,11 @@
 //! ρ → Σ_k K_k ρ K_k†    with   K_k = √p_k |k⟩⟨k|
 //! ```
 
-use alloc::{string::String, vec::Vec};
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
+use core::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
@@ -70,23 +73,172 @@ pub const MAX_GAS_LIMIT: u64 = 0xFFFF_FFFF;
 pub const MIN_BASE_FEE: u64 = 1;
 
 // -----------------------------------------------------------------------------
-// Basic type aliases
+// Type aliases
 // -----------------------------------------------------------------------------
 
-/// Block height (0 = genesis).
-pub type Height = u64;
-
-/// Consensus round number.
-pub type Round = u32;
-
-/// 32‑byte hash (Blake3 or SHA‑256).
-pub type Hash32 = [u8; HASH_SIZE];
+/// Simple KV state for execution (key‑value pairs).
+pub type KvState = BTreeMap<Vec<u8>, Vec<u8>>;
 
 /// Raw transaction bytes (opaque).
 pub type Tx = Vec<u8>;
 
-/// Simple KV state for execution (key‑value pairs).
-pub type KvState = alloc::collections::BTreeMap<Vec<u8>, Vec<u8>>;
+// -----------------------------------------------------------------------------
+// Newtype wrappers for type safety
+// -----------------------------------------------------------------------------
+
+/// Block height (0 = genesis).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+    Serialize, Deserialize,
+)]
+pub struct Height(pub u64);
+
+impl Height {
+    /// Create a new height.
+    pub const fn new(h: u64) -> Self {
+        Self(h)
+    }
+
+    /// Get the inner value.
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    /// Saturating subtraction.
+    pub const fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+
+    /// Checked addition.
+    pub const fn checked_add(self, other: Self) -> Option<Self> {
+        match self.0.checked_add(other.0) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+}
+
+impl From<u64> for Height {
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl From<Height> for u64 {
+    fn from(h: Height) -> Self {
+        h.0
+    }
+}
+
+impl fmt::Display for Height {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for Height {
+    type Err = core::num::ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        u64::from_str(s).map(Self)
+    }
+}
+
+/// Consensus round number.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+    Serialize, Deserialize,
+)]
+pub struct Round(pub u32);
+
+impl Round {
+    pub const fn new(r: u32) -> Self {
+        Self(r)
+    }
+    pub const fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for Round {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<Round> for u32 {
+    fn from(r: Round) -> Self {
+        r.0
+    }
+}
+
+impl fmt::Display for Round {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// 32‑byte hash (Blake3 or SHA‑256).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+    Serialize, Deserialize,
+)]
+pub struct Hash32(pub [u8; HASH_SIZE]);
+
+impl Hash32 {
+    /// Create a zero hash.
+    pub const fn zero() -> Self {
+        Self([0u8; HASH_SIZE])
+    }
+
+    /// Convert to a hex string.
+    pub fn to_hex(&self) -> String {
+        hex::encode(&self.0)
+    }
+
+    /// Parse from a hex string (with or without 0x).
+    pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
+        let s = s.trim_start_matches("0x");
+        let bytes = hex::decode(s)?;
+        if bytes.len() != HASH_SIZE {
+            return Err(hex::FromHexError::InvalidStringLength);
+        }
+        let mut arr = [0u8; HASH_SIZE];
+        arr.copy_from_slice(&bytes);
+        Ok(Self(arr))
+    }
+
+    /// Check if the hash is zero.
+    pub const fn is_zero(&self) -> bool {
+        let arr = self.0;
+        let mut i = 0;
+        while i < HASH_SIZE {
+            if arr[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+impl Default for Hash32 {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+impl fmt::Display for Hash32 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{}", self.to_hex())
+    }
+}
+
+impl FromStr for Hash32 {
+    type Err = hex::FromHexError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_hex(s)
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Quantum Protocol State
@@ -269,7 +421,7 @@ impl BlockHeader {
     /// Classical validation (unchanged logic).
     pub fn validate(&self) -> Result<(), &'static str> {
         // Genesis block must have zero parent hash.
-        if self.height == 0 && self.parent_id != [0u8; HASH_SIZE] {
+        if self.height == Height(0) && !self.parent_id.is_zero() {
             return Err("genesis block must have zero parent hash");
         }
         if self.gas_limit < MIN_GAS_LIMIT {
@@ -315,7 +467,8 @@ impl BlockHeader {
     #[must_use]
     pub fn id(&self) -> Hash32 {
         let encoded = postcard::to_allocvec(self).unwrap_or_default();
-        crate::consensus::engine::sha256_hash(&encoded)
+        let hash = blake3::hash(&encoded);
+        Hash32(*hash.as_bytes())
     }
 
     /// Compute the block ID with quantum state tracking.
@@ -402,15 +555,13 @@ impl Block {
 #[must_use]
 pub fn tx_root(txs: &[Tx]) -> Hash32 {
     if txs.is_empty() {
-        return [0u8; HASH_SIZE];
+        return Hash32::zero();
     }
     let mut hasher = blake3::Hasher::new();
     for tx in txs {
-        hasher.update(&crate::consensus::engine::sha256_hash(tx));
+        hasher.update(&blake3::hash(tx).as_bytes());
     }
-    let mut out = [0u8; HASH_SIZE];
-    out.copy_from_slice(hasher.finalize().as_bytes());
-    out
+    Hash32(*hasher.finalize().as_bytes())
 }
 
 /// Compute the transaction root with quantum state tracking.
@@ -426,30 +577,6 @@ pub fn tx_root_quantum(txs: &[Tx]) -> (Hash32, QuantumProtocolState) {
 // -----------------------------------------------------------------------------
 // Hash32 utilities
 // -----------------------------------------------------------------------------
-
-/// Convert a `Hash32` to a hex string.
-#[must_use]
-pub fn hash32_to_hex(h: &Hash32) -> String {
-    hex::encode(h)
-}
-
-/// Convert a hex string to a `Hash32` (returns `None` on invalid length).
-#[must_use]
-pub fn hex_to_hash32(s: &str) -> Option<Hash32> {
-    let bytes = hex::decode(s).ok()?;
-    if bytes.len() != HASH_SIZE {
-        return None;
-    }
-    let mut out = [0u8; HASH_SIZE];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
-
-/// Zero hash (all zeros).
-#[must_use]
-pub const fn zero_hash() -> Hash32 {
-    [0u8; HASH_SIZE]
-}
 
 /// Compute quantum fidelity between two hashes.
 ///
@@ -470,13 +597,31 @@ mod tests {
 
     // ── Classical tests ────────────────────────────────────────────────
     #[test]
+    fn test_height_operations() {
+        let h = Height::new(100);
+        assert_eq!(h.as_u64(), 100);
+        assert_eq!(Height::from(42).as_u64(), 42);
+        assert_eq!(u64::from(h), 100);
+        assert_eq!(format!("{}", h), "100");
+    }
+
+    #[test]
+    fn test_hash32_roundtrip() {
+        let h = Hash32::zero();
+        assert!(h.is_zero());
+        let hex = h.to_hex();
+        let h2 = Hash32::from_hex(&hex).unwrap();
+        assert_eq!(h, h2);
+    }
+
+    #[test]
     fn test_block_header_validation() {
         let mut header = BlockHeader {
-            height: 1,
-            round: 0,
-            parent_id: zero_hash(),
-            state_root: zero_hash(),
-            tx_root: zero_hash(),
+            height: Height(1),
+            round: Round(0),
+            parent_id: Hash32::zero(),
+            state_root: Hash32::zero(),
+            tx_root: Hash32::zero(),
             proposer_pk: vec![0u8; 32],
             proposer_addr: "proposer".into(),
             base_fee: 1,
@@ -507,23 +652,9 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_hash() {
-        let z = zero_hash();
-        assert_eq!(z, [0u8; HASH_SIZE]);
-    }
-
-    #[test]
-    fn test_hash32_hex_roundtrip() {
-        let original = [0xAA; HASH_SIZE];
-        let hex = hash32_to_hex(&original);
-        let decoded = hex_to_hash32(&hex).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
     fn test_tx_root_empty() {
         let root = tx_root(&[]);
-        assert_eq!(root, zero_hash());
+        assert!(root.is_zero());
     }
 
     #[test]
@@ -568,11 +699,11 @@ mod tests {
     #[test]
     fn test_header_validate_quantum_ok() {
         let header = BlockHeader {
-            height: 1,
-            round: 0,
-            parent_id: zero_hash(),
-            state_root: zero_hash(),
-            tx_root: zero_hash(),
+            height: Height(1),
+            round: Round(0),
+            parent_id: Hash32::zero(),
+            state_root: Hash32::zero(),
+            tx_root: Hash32::zero(),
             proposer_pk: vec![0u8; 32],
             proposer_addr: "proposer".into(),
             base_fee: 1,
@@ -590,11 +721,11 @@ mod tests {
     #[test]
     fn test_header_validate_quantum_failure() {
         let header = BlockHeader {
-            height: 0,
-            round: 0,
-            parent_id: [1u8; HASH_SIZE], // invalid
-            state_root: zero_hash(),
-            tx_root: zero_hash(),
+            height: Height(0),
+            round: Round(0),
+            parent_id: Hash32([1u8; HASH_SIZE]), // invalid
+            state_root: Hash32::zero(),
+            tx_root: Hash32::zero(),
             proposer_pk: vec![0u8; 32],
             proposer_addr: "proposer".into(),
             base_fee: 1,
@@ -611,10 +742,10 @@ mod tests {
     #[test]
     fn test_block_validate_quantum() {
         let header = BlockHeader {
-            height: 1,
-            round: 0,
-            parent_id: zero_hash(),
-            state_root: zero_hash(),
+            height: Height(1),
+            round: Round(0),
+            parent_id: Hash32::zero(),
+            state_root: Hash32::zero(),
             tx_root: tx_root(&[vec![1, 2, 3]]),
             proposer_pk: vec![0u8; 32],
             proposer_addr: "proposer".into(),
@@ -637,11 +768,11 @@ mod tests {
     #[test]
     fn test_id_quantum() {
         let header = BlockHeader {
-            height: 1,
-            round: 0,
-            parent_id: zero_hash(),
-            state_root: zero_hash(),
-            tx_root: zero_hash(),
+            height: Height(1),
+            round: Round(0),
+            parent_id: Hash32::zero(),
+            state_root: Hash32::zero(),
+            tx_root: Hash32::zero(),
             proposer_pk: vec![0u8; 32],
             proposer_addr: "proposer".into(),
             base_fee: 1,
@@ -651,15 +782,15 @@ mod tests {
             coherence: 1.0,
         };
         let (id, qstate) = header.id_quantum();
-        assert_eq!(id.len(), HASH_SIZE);
+        assert!(!id.is_zero());
         assert!(qstate.crypto_coherence < 1.0);
     }
 
     #[test]
     fn test_hash_fidelity() {
-        let a = [1u8; HASH_SIZE];
-        let b = [1u8; HASH_SIZE];
-        let c = [2u8; HASH_SIZE];
+        let a = Hash32([1u8; HASH_SIZE]);
+        let b = Hash32([1u8; HASH_SIZE]);
+        let c = Hash32([2u8; HASH_SIZE]);
         assert!((hash_fidelity(&a, &b) - 1.0).abs() < 1e-10);
         assert!((hash_fidelity(&a, &c) - 0.0).abs() < 1e-10);
     }
@@ -667,7 +798,7 @@ mod tests {
     #[test]
     fn test_receipt_validate_quantum() {
         let receipt = Receipt {
-            tx_hash: zero_hash(),
+            tx_hash: Hash32::zero(),
             success: true,
             gas_used: 21000,
             logs: vec![],
@@ -682,11 +813,11 @@ mod tests {
     #[test]
     fn test_coherence_accessors() {
         let header = BlockHeader {
-            height: 1,
-            round: 0,
-            parent_id: zero_hash(),
-            state_root: zero_hash(),
-            tx_root: zero_hash(),
+            height: Height(1),
+            round: Round(0),
+            parent_id: Hash32::zero(),
+            state_root: Hash32::zero(),
+            tx_root: Hash32::zero(),
             proposer_pk: vec![0u8; 32],
             proposer_addr: "proposer".into(),
             base_fee: 1,
