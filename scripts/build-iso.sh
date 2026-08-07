@@ -23,16 +23,27 @@
 #   --uefi-bin FILE     Path to BOOTX64.EFI (overrides automatic detection)
 #   --grub-cfg FILE     Custom GRUB configuration file
 #   --label STRING      ISO volume label (default: IONA_ISO)
+#   --efi-size KB       Size of EFI image in KiB (default: 4096)
 #   --no-clean          Keep temporary build directory
 #   --verbose           Verbose output
+#   --quiet             Suppress non‑error output
+#   --version           Show version
 #   --help, -h          Show this help message
 #
 # Environment variables:
 #   IONA_VERBOSE        Set to 1 for verbose output
+#   IONA_QUIET          Set to 1 for quiet mode
+#   IONA_NO_COLOR       Set to 1 to disable colour output
+#   IONA_EFI_SIZE_KB    Override EFI image size in KiB
 # =============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
+
+# -----------------------------------------------------------------------------
+# Version
+# -----------------------------------------------------------------------------
+readonly SCRIPT_VERSION="2.0.0"
 
 # -----------------------------------------------------------------------------
 # Constants & defaults
@@ -42,42 +53,48 @@ readonly ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 readonly DEFAULT_OUTPUT="$ROOT_DIR/dist/iona-efi.iso"
 readonly DEFAULT_KERNEL="$ROOT_DIR/dist/iona-os-kernel.elf"
 readonly DEFAULT_LABEL="IONA_ISO"
-readonly EFI_IMG_SIZE_KB=4096   # 4 MiB
+DEFAULT_EFI_SIZE_KB="${IONA_EFI_SIZE_KB:-4096}"
 
 # -----------------------------------------------------------------------------
-# Colours (only if stdout is a terminal)
+# Colours (respect IONA_NO_COLOR and terminal detection)
 # -----------------------------------------------------------------------------
-if [[ -t 1 ]]; then
+if [[ -z "${IONA_NO_COLOR:-}" && -t 1 ]]; then
     readonly GREEN='\033[0;32m'
     readonly YELLOW='\033[1;33m'
     readonly RED='\033[0;31m'
+    readonly BLUE='\033[0;34m'
     readonly NC='\033[0m'
 else
     readonly GREEN=''
     readonly YELLOW=''
     readonly RED=''
+    readonly BLUE=''
     readonly NC=''
 fi
 
 # -----------------------------------------------------------------------------
 # Logging functions
 # -----------------------------------------------------------------------------
-log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*" >&2; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+_log_level=2  # 0=quiet, 1=error, 2=info, 3=debug
+if [[ "${IONA_VERBOSE:-0}" -eq 1 ]]; then _log_level=3; fi
+if [[ "${IONA_QUIET:-0}" -eq 1 ]]; then _log_level=1; fi
+
+log_debug() { [[ $_log_level -ge 3 ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2; }
+log_info()  { [[ $_log_level -ge 2 ]] && echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { [[ $_log_level -ge 2 ]] && echo -e "${YELLOW}[WARN]${NC}  $*" >&2; }
+log_error() { [[ $_log_level -ge 1 ]] && echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die()       { log_error "$*"; exit 1; }
 
-if [[ "${IONA_VERBOSE:-0}" -eq 1 ]]; then
-    log_debug() { echo -e "[DEBUG] $*"; }
-else
-    log_debug() { :; }
-fi
-
 # -----------------------------------------------------------------------------
-# Help
+# Help & version
 # -----------------------------------------------------------------------------
 show_help() {
     sed -n '2,/^$/p' "$0" | sed 's/^# //'
+    exit 0
+}
+
+show_version() {
+    echo "build-iso.sh version ${SCRIPT_VERSION}"
     exit 0
 }
 
@@ -89,8 +106,10 @@ KERNEL_ELF="$DEFAULT_KERNEL"
 UEFI_BIN=""
 GRUB_CFG=""
 LABEL="$DEFAULT_LABEL"
+EFI_SIZE_KB="$DEFAULT_EFI_SIZE_KB"
 NO_CLEAN=0
 VERBOSE=0
+QUIET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -119,6 +138,11 @@ while [[ $# -gt 0 ]]; do
             LABEL="$2"
             shift 2
             ;;
+        --efi-size)
+            if [[ -z "${2:-}" ]]; then die "--efi-size requires an argument"; fi
+            EFI_SIZE_KB="$2"
+            shift 2
+            ;;
         --no-clean)
             NO_CLEAN=1
             shift
@@ -126,7 +150,17 @@ while [[ $# -gt 0 ]]; do
         --verbose)
             VERBOSE=1
             IONA_VERBOSE=1
+            _log_level=3
             shift
+            ;;
+        --quiet)
+            QUIET=1
+            IONA_QUIET=1
+            _log_level=1
+            shift
+            ;;
+        --version)
+            show_version
             ;;
         --help|-h)
             show_help
@@ -141,15 +175,44 @@ while [[ $# -gt 0 ]]; do
 done
 
 # -----------------------------------------------------------------------------
-# Dependency checks
+# Validate configuration
 # -----------------------------------------------------------------------------
-check_deps() {
-    if ! command -v xorriso &>/dev/null; then
-        die "xorriso not found. Install: sudo apt install xorriso"
-    fi
+validate_config() {
     if [[ ! -f "$KERNEL_ELF" ]]; then
         die "Kernel ELF not found: $KERNEL_ELF. Build kernel first."
     fi
+    if [[ "$EFI_SIZE_KB" -lt 1024 ]]; then
+        die "EFI size must be at least 1024 KiB"
+    fi
+    if [[ -z "$OUTPUT" ]]; then
+        die "Output path cannot be empty"
+    fi
+    # Ensure output directory exists
+    mkdir -p "$(dirname "$OUTPUT")"
+}
+
+# -----------------------------------------------------------------------------
+# Dependency checks
+# -----------------------------------------------------------------------------
+check_deps() {
+    local missing=0
+    for cmd in xorriso; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log_error "Required command not found: $cmd"
+            missing=1
+        fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        die "Missing required dependencies. Install: sudo apt install xorriso"
+    fi
+
+    # Optional mtools check
+    if ! command -v mkdosfs &>/dev/null || ! command -v mcopy &>/dev/null; then
+        log_warn "mtools (mkdosfs/mcopy) not found. EFI image will be raw (less compatible)."
+        log_warn "Install: sudo apt install mtools dosfstools"
+        return 1  # signal missing mtools
+    fi
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -234,16 +297,17 @@ GRUB_CFG
         fi
         rm -f "$grub_cfg_tmp"
         log_warn "grub-mkstandalone failed"
+    else
+        log_debug "grub-mkstandalone not available"
     fi
 
     # 4. Fallback: try to extract from disk image (legacy)
-    if [[ -f "$ROOT_DIR/dist/iona-disk.img" ]]; then
-        log_info "Attempting to extract UEFI binary from disk image..."
-        local offset
-        if offset=$(fdisk -l "$ROOT_DIR/dist/iona-disk.img" 2>/dev/null | grep -i efi | awk '{print $2}'); then
-            # This is complex; skipping for brevity. In production you'd use a proper tool.
-            log_warn "Automatic extraction not implemented. Place BOOTX64.EFI in dist/ or install grub-efi-amd64-bin."
-        fi
+    local disk_img="$ROOT_DIR/dist/iona-disk.img"
+    if [[ -f "$disk_img" ]]; then
+        log_info "Attempting to extract UEFI binary from $disk_img..."
+        # Use dd + loop mount or parted to find EFI partition
+        # This is a simplified stub; a full implementation would use losetup/mount
+        log_warn "Automatic extraction not implemented. Place BOOTX64.EFI in dist/ or install grub-efi-amd64-bin."
     fi
 
     die "Cannot find or build BOOTX64.EFI.
@@ -266,15 +330,14 @@ create_efi_image() {
     fi
 
     if ! command -v mkdosfs &>/dev/null || ! command -v mcopy &>/dev/null; then
-        log_warn "mtools (mkdosfs/mcopy) not found. EFI boot image will be raw binary (less compatible)."
+        log_warn "mtools not found. EFI boot image will be raw binary (less compatible)."
         log_warn "Install: sudo apt install mtools dosfstools"
-        # Return a flag for raw binary mode
         echo "raw"
         return 0
     fi
 
-    log_info "Creating FAT12 EFI image (${EFI_IMG_SIZE_KB}KiB)..."
-    dd if=/dev/zero of="$efi_img" bs=1K count="$EFI_IMG_SIZE_KB" status=none || die "dd failed"
+    log_info "Creating FAT12 EFI image (${EFI_SIZE_KB}KiB)..."
+    dd if=/dev/zero of="$efi_img" bs=1K count="$EFI_SIZE_KB" status=none || die "dd failed"
     mkdosfs -F 12 "$efi_img" >/dev/null || die "mkdosfs failed"
     export MTOOLS_SKIP_CHECK=1
     mmd -i "$efi_img" ::/EFI ::/EFI/BOOT >/dev/null 2>&1 || true
@@ -292,6 +355,7 @@ build_iso() {
     local label="$3"
     local efi_mode="$4"  # "image" or "raw"
 
+    # Build xorriso arguments array
     local xorriso_args=(
         -as mkisofs
         -iso-level 3
@@ -299,6 +363,10 @@ build_iso() {
         -volid "$label"
         -rational-rock
         -joliet
+        -eltorito-boot boot/iona-os-kernel.elf
+        -no-emul-boot
+        -boot-load-size 4
+        -boot-info-table
     )
 
     if [[ "$efi_mode" == "image" ]]; then
@@ -338,7 +406,10 @@ build_iso() {
 # Main
 # -----------------------------------------------------------------------------
 main() {
+    log_debug "Starting build-iso.sh v${SCRIPT_VERSION}"
+    validate_config
     check_deps
+    local mtools_ok=$?
 
     # Create temporary build directory
     local iso_root
@@ -364,7 +435,12 @@ main() {
 
     # Create EFI image (if possible)
     local efi_mode
-    efi_mode="$(create_efi_image "$iso_root")"
+    if [[ $mtools_ok -eq 0 ]]; then
+        efi_mode="$(create_efi_image "$iso_root")"
+    else
+        efi_mode="raw"
+        log_warn "Using raw EFI binary mode (no FAT image)"
+    fi
 
     # Build ISO
     build_iso "$iso_root" "$OUTPUT" "$LABEL" "$efi_mode"
