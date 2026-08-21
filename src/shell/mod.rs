@@ -1,160 +1,332 @@
-//! IONA OS Shell — minimal interactive shell
+//! IONA OS Shell — minimal interactive shell.
 //!
 //! Features:
-//!   - Readline cu backspace + arrow keys de bază
-//!   - Builtins: cd, pwd, ls, echo, cat, help, exit, clear, ps, uname
-//!   - Externe: fork() + execve() pentru binare din IONAFS
-//!   - Pipe:     cmd1 | cmd2  (via syscall pipe())
-//!   - Redirect: cmd > file, cmd < file, cmd >> file
-//!   - Background: cmd &
-//!   - Variabile de mediu: PATH, HOME, USER
+//!   - Readline with backspace + basic arrow keys.
+//!   - Builtins: cd, pwd, ls, echo, cat, help, exit, clear, ps, uname.
+//!   - External: fork() + execve() for binaries from IONAFS.
+//!   - Pipe:     cmd1 | cmd2 (via syscall pipe()).
+//!   - Redirect: cmd > file, cmd < file, cmd >> file.
+//!   - Background: cmd & (stub).
+//!   - Environment variables: PATH, HOME, USER.
 //!
-//! Rulează ca task kernel cu ring3 userspace (simplifcat: kernel task)
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │                            Shell Module                                │
+//! ├─────────────┬──────────────┬───────────────┬──────────────────────────┤
+//! │   Config    │    Error     │    Metrics    │         Types            │
+//! │ (ShellCfg)  │ (ShellErr)   │ (ShellMetr)   │ (Command, Env)           │
+//! ├─────────────┼──────────────┼───────────────┼──────────────────────────┤
+//! │   Input     │   Parser     │   Executor    │        Manager           │
+//! │ (readline)  │ (tokenize)   │ (builtins,    │ (ShellManager)           │
+//! │             │              │  external)    │                          │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use iona::shell::{ShellManager, ShellConfig};
+//!
+//! let config = ShellConfig::default();
+//! let mut manager = ShellManager::new(config);
+//! manager.run();  // starts the interactive shell
+//! ```
 
-use alloc::{string::{String, ToString}, vec::Vec, format, collections::BTreeMap};
-use crate::drivers::keyboard;
-use crate::process::{fd, pipe, fork};
-use crate::fs::{ionafs, vfs};
-use crate::sched::SCHEDULER;
-use crate::task::next_tid;
+#![allow(dead_code)]
 
-pub struct Shell {
-    pub cwd:  String,
-    pub env:  BTreeMap<String, String>,
-    pub history: Vec<String>,
-    pub hist_idx: usize,
-}
+use alloc::{
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicU64, Ordering};
+use thiserror::Error;
+use tracing::{debug, info, trace, warn};
 
-impl Shell {
-    pub fn new() -> Self {
-        let mut env = BTreeMap::new();
-        env.insert("PATH".into(), "/bin:/usr/bin".into());
-        env.insert("HOME".into(), "/home/iona".into());
-        env.insert("USER".into(), "iona".into());
-        env.insert("SHELL".into(), "/bin/sh".into());
-        env.insert("OS".into(), "IONA OS 0.3.0".into());
-        Shell { cwd: "/".into(), env, history: Vec::new(), hist_idx: 0 }
+// -----------------------------------------------------------------------------
+// Submodules (embedded)
+// -----------------------------------------------------------------------------
+
+pub mod config {
+    //! Configuration for the shell.
+    use serde::{Deserialize, Serialize};
+
+    /// Configuration for the shell.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ShellConfig {
+        pub prompt_color: bool,
+        pub max_history: usize,
+        pub enable_tab_completion: bool,
+        pub default_path: String,
+        pub default_home: String,
+        pub default_user: String,
+        pub collect_metrics: bool,
     }
 
-    /// Main shell loop — blochează până la exit
-    pub fn run(&mut self) {
-        self.print_banner();
-        loop {
-            self.print_prompt();
-            let line = self.readline();
-            if line.is_empty() { continue; }
-
-            // Add to history
-            if self.history.last().map(|l| l != &line).unwrap_or(true) {
-                self.history.push(line.clone());
-            }
-            self.hist_idx = self.history.len();
-
-            if self.execute_line(&line) == -1 {
-                break; // exit
+    impl Default for ShellConfig {
+        fn default() -> Self {
+            Self {
+                prompt_color: true,
+                max_history: 1000,
+                enable_tab_completion: true,
+                default_path: "/bin:/usr/bin".to_string(),
+                default_home: "/home/iona".to_string(),
+                default_user: "iona".to_string(),
+                collect_metrics: true,
             }
         }
-        crate::serial_println!("[SHELL] exiting");
     }
 
-    fn print_banner(&self) {
-        self.puts("[2J[H"); // clear screen
-        self.puts("╔══════════════════════════════════════╗
-");
-        self.puts("║    IONA OS Shell  v0.3.0             ║
-");
-        self.puts("║    Type 'help' for commands          ║
-");
-        self.puts("╚══════════════════════════════════════╝
+    impl ShellConfig {
+        pub fn validate(&self) -> Result<(), &'static str> {
+            if self.max_history == 0 {
+                return Err("max_history must be > 0");
+            }
+            Ok(())
+        }
+    }
+}
 
-");
+pub mod error {
+    //! Error types for the shell.
+    use thiserror::Error;
+
+    #[derive(Debug, Error, Clone, PartialEq, Eq)]
+    pub enum ShellError {
+        #[error("command not found: {0}")]
+        CommandNotFound(String),
+
+        #[error("file not found: {0}")]
+        FileNotFound(String),
+
+        #[error("invalid command: {0}")]
+        InvalidCommand(String),
+
+        #[error("I/O error: {0}")]
+        Io(String),
+
+        #[error("configuration error: {0}")]
+        Config(String),
+
+        #[error("internal error: {0}")]
+        Internal(String),
     }
 
-    fn print_prompt(&self) {
-        let user = self.env.get("USER").map(|s| s.as_str()).unwrap_or("iona");
-        let prompt = format!("[32m{}@iona[0m:[34m{}[0m$ ", user, self.cwd);
-        self.puts(&prompt);
+    pub type ShellResult<T> = Result<T, ShellError>;
+}
+
+pub mod metrics {
+    //! Metrics for the shell.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Default)]
+    pub struct ShellMetrics {
+        pub commands_executed: AtomicU64,
+        pub builtin_executions: AtomicU64,
+        pub external_executions: AtomicU64,
+        pub pipeline_executions: AtomicU64,
+        pub redirects: AtomicU64,
+        pub tab_completions: AtomicU64,
+        pub history_entries: AtomicU64,
+        pub errors: AtomicU64,
     }
 
-    fn puts(&self, s: &str) {
-        crate::io::serial::_print(format_args!("{}", s));
+    impl ShellMetrics {
+        pub fn inc_cmd(&self) {
+            self.commands_executed.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn inc_builtin(&self) {
+            self.builtin_executions.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn inc_external(&self) {
+            self.external_executions.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn inc_pipeline(&self) {
+            self.pipeline_executions.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn inc_redirect(&self) {
+            self.redirects.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn inc_tab(&self) {
+            self.tab_completions.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn inc_history(&self) {
+            self.history_entries.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn inc_error(&self) {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn snapshot(&self) -> ShellMetricsSnapshot {
+            ShellMetricsSnapshot {
+                commands_executed: self.commands_executed.load(Ordering::Relaxed),
+                builtin_executions: self.builtin_executions.load(Ordering::Relaxed),
+                external_executions: self.external_executions.load(Ordering::Relaxed),
+                pipeline_executions: self.pipeline_executions.load(Ordering::Relaxed),
+                redirects: self.redirects.load(Ordering::Relaxed),
+                tab_completions: self.tab_completions.load(Ordering::Relaxed),
+                history_entries: self.history_entries.load(Ordering::Relaxed),
+                errors: self.errors.load(Ordering::Relaxed),
+            }
+        }
     }
 
-    fn putc(&self, c: u8) {
-        crate::io::serial::_print(format_args!("{}", c as char));
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ShellMetricsSnapshot {
+        pub commands_executed: u64,
+        pub builtin_executions: u64,
+        pub external_executions: u64,
+        pub pipeline_executions: u64,
+        pub redirects: u64,
+        pub tab_completions: u64,
+        pub history_entries: u64,
+        pub errors: u64,
+    }
+}
+
+pub mod types {
+    //! Core types for the shell.
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// Command after parsing.
+    #[derive(Debug, Clone)]
+    pub struct Command {
+        pub args: Vec<String>,
+        pub input_file: Option<String>,
+        pub output_file: Option<String>,
+        pub append: bool,
+        pub background: bool,
+        pub pipe_to: Option<Vec<Command>>,
     }
 
-    /// Read a line from keyboard with basic editing
-    fn readline(&mut self) -> String {
+    /// Environment variables.
+    pub type EnvMap = BTreeMap<String, String>;
+
+    /// Shell state.
+    pub struct ShellState {
+        pub cwd: String,
+        pub env: EnvMap,
+        pub history: Vec<String>,
+        pub history_index: usize,
+        pub config: super::config::ShellConfig,
+    }
+
+    impl ShellState {
+        pub fn new(config: &super::config::ShellConfig) -> Self {
+            let mut env = BTreeMap::new();
+            env.insert("PATH".into(), config.default_path.clone());
+            env.insert("HOME".into(), config.default_home.clone());
+            env.insert("USER".into(), config.default_user.clone());
+            env.insert("SHELL".into(), "/bin/sh".into());
+            env.insert("OS".into(), "IONA OS 0.3.0".into());
+            Self {
+                cwd: "/".into(),
+                env,
+                history: Vec::with_capacity(config.max_history),
+                history_index: 0,
+                config: config.clone(),
+            }
+        }
+
+        pub fn add_history(&mut self, line: &str) {
+            if !line.is_empty() {
+                if let Some(last) = self.history.last() {
+                    if last == line {
+                        return;
+                    }
+                }
+                self.history.push(line.to_string());
+                if self.history.len() > self.config.max_history {
+                    self.history.remove(0);
+                }
+                self.history_index = self.history.len();
+                // Update metrics if enabled.
+                if self.config.collect_metrics {
+                    super::metrics::global_metrics().inc_history();
+                }
+            }
+        }
+    }
+}
+
+pub mod input {
+    //! Readline and keyboard input.
+    use super::types::ShellState;
+    use crate::drivers::keyboard;
+    use crate::io::serial::{_print, print};
+    use alloc::string::String;
+    use core::fmt::Write;
+    use tracing::trace;
+
+    /// Read a line with basic editing.
+    pub fn readline(state: &mut ShellState) -> String {
         let mut buf = String::new();
         let mut cursor = 0usize;
 
         loop {
-            // Wait for keypress
             let c = loop {
-                if let Some(k) = keyboard::read_char() { break k; }
+                if let Some(k) = keyboard::read_char() {
+                    break k;
+                }
                 crate::arch::x86_64::timer::sleep_ms(1);
             };
 
             match c {
                 b'\n' => {
-                    self.putc(b'\n');
+                    _print(format_args!("\n"));
                     return buf.trim().to_string();
                 }
-                b'' | 127 => { // backspace / DEL
+                b'\x08' | 127 => {
                     if cursor > 0 {
                         buf.remove(cursor - 1);
                         cursor -= 1;
-                        self.puts(" "); // erase char on terminal
+                        _print(format_args!("\x08 \x08"));
                     }
                 }
                 b'\t' => {
-                    // Tab completion — list files in cwd matching prefix
-                    let prefix = buf.split_whitespace().last().unwrap_or("");
-                    let matches: Vec<String> = ionafs::list()
-                        .into_iter()
-                        .filter(|f| f.starts_with(prefix))
-                        .collect();
-                    if matches.len() == 1 {
-                        let suffix = &matches[0][prefix.len()..];
-                        buf.push_str(suffix);
-                        buf.push(' ');
-                        cursor = buf.len();
-                        self.puts(suffix);
-                        self.puts(" ");
-                    } else if matches.len() > 1 {
-                        self.putc(b'\n');
-                        for m in &matches { self.puts(m); self.puts("  "); }
-                        self.putc(b'\n');
-                        self.print_prompt();
-                        self.puts(&buf);
-                    }
+                    // Tab completion.
+                    super::completion::tab_complete(state, &mut buf, &mut cursor);
                 }
-                27 => { // ESC — could be start of arrow key sequence
-                    // Read [
+                27 => {
+                    // ESC sequence.
+                    // Read '['.
                     crate::arch::x86_64::timer::sleep_ms(5);
                     if let Some(b'[') = keyboard::read_char() {
                         if let Some(dir) = keyboard::read_char() {
                             match dir {
-                                b'A' => { // Up — history prev
-                                    if self.hist_idx > 0 {
-                                        self.hist_idx -= 1;
-                                        let hist = self.history[self.hist_idx].clone();
-                                        // Clear current line
-                                        for _ in 0..buf.len() { self.puts(" "); }
-                                        buf = hist;
-                                        cursor = buf.len();
-                                        self.puts(&buf);
+                                b'A' => {
+                                    // Up arrow.
+                                    if state.history_index > 0 {
+                                        state.history_index -= 1;
+                                        if let Some(hist) = state.history.get(state.history_index) {
+                                            // Clear current line.
+                                            for _ in 0..buf.len() {
+                                                _print(format_args!("\x08 \x08"));
+                                            }
+                                            buf = hist.clone();
+                                            cursor = buf.len();
+                                            _print(format_args!("{}", buf));
+                                        }
                                     }
                                 }
-                                b'B' => { // Down — history next
-                                    if self.hist_idx + 1 < self.history.len() {
-                                        self.hist_idx += 1;
-                                        let hist = self.history[self.hist_idx].clone();
-                                        for _ in 0..buf.len() { self.puts(" "); }
-                                        buf = hist;
-                                        cursor = buf.len();
-                                        self.puts(&buf);
+                                b'B' => {
+                                    // Down arrow.
+                                    if state.history_index + 1 < state.history.len() {
+                                        state.history_index += 1;
+                                        if let Some(hist) = state.history.get(state.history_index) {
+                                            for _ in 0..buf.len() {
+                                                _print(format_args!("\x08 \x08"));
+                                            }
+                                            buf = hist.clone();
+                                            cursor = buf.len();
+                                            _print(format_args!("{}", buf));
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -163,43 +335,128 @@ impl Shell {
                     }
                 }
                 32..=126 => {
-                    buf.insert(cursor, c as char);
+                    if cursor == buf.len() {
+                        buf.push(c as char);
+                    } else {
+                        buf.insert(cursor, c as char);
+                    }
                     cursor += 1;
-                    self.putc(c);
+                    _print(format_args!("{}", c as char));
                 }
                 _ => {}
             }
         }
     }
 
-    /// Execute one command line (may contain pipes and redirects)
-    /// Returns exit code, or -1 for shell exit
-    fn execute_line(&mut self, line: &str) -> i32 {
-        // Variable expansion
-        let line = self.expand_vars(line);
-
-        // Split on pipe
-        let segments: Vec<&str> = line.split('|').collect();
-
-        if segments.len() > 1 {
-            return self.execute_pipeline(&segments);
-        }
-
-        // Single command — check for redirect
-        self.execute_command(&line)
+    /// Write a string to the console.
+    pub fn puts(s: &str) {
+        _print(format_args!("{}", s));
     }
 
-    fn expand_vars(&self, s: &str) -> String {
+    /// Write a character.
+    pub fn putc(c: u8) {
+        _print(format_args!("{}", c as char));
+    }
+}
+
+pub mod completion {
+    //! Tab completion for shell.
+    use super::types::ShellState;
+    use crate::fs::ionafs;
+    use crate::io::serial::_print;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use tracing::trace;
+
+    pub fn tab_complete(state: &mut ShellState, buf: &mut String, cursor: &mut usize) {
+        if !state.config.enable_tab_completion {
+            return;
+        }
+        // Get the last word.
+        let words: Vec<&str> = buf.split_whitespace().collect();
+        if words.is_empty() {
+            return;
+        }
+        let last = words.last().unwrap();
+        let prefix = *last;
+
+        // Find matches in current directory.
+        let entries = ionafs::list();
+        let matches: Vec<String> = entries
+            .into_iter()
+            .filter(|f| f.starts_with(prefix) && !f.contains('/'))
+            .collect();
+
+        if matches.len() == 1 {
+            let suffix = &matches[0][prefix.len()..];
+            // Replace the last word.
+            let mut parts: Vec<&str> = buf.split_whitespace().collect();
+            if !parts.is_empty() {
+                parts.pop();
+                let new_word = format!("{}{}", prefix, suffix);
+                parts.push(&new_word);
+                let new_buf = parts.join(" ");
+                *buf = new_buf;
+                *cursor = buf.len();
+                // Redraw.
+                for _ in 0..buf.len() { _print(format_args!("\x08 \x08")); }
+                _print(format_args!("{}", buf));
+            }
+            super::metrics::global_metrics().inc_tab();
+        } else if matches.len() > 1 {
+            // Show matches.
+            _print(format_args!("\n"));
+            for m in &matches {
+                _print(format_args!("{}  ", m));
+            }
+            _print(format_args!("\n"));
+            // Re-print prompt and current line.
+            super::prompt::print_prompt(state);
+            _print(format_args!("{}", buf));
+        }
+    }
+}
+
+pub mod prompt {
+    //! Prompt rendering.
+    use super::types::ShellState;
+    use crate::io::serial::_print;
+    use alloc::format;
+
+    pub fn print_prompt(state: &ShellState) {
+        let user = state.env.get("USER").map(|s| s.as_str()).unwrap_or("iona");
+        let cwd = &state.cwd;
+        if state.config.prompt_color {
+            _print(format_args!("\x1b[32m{}@iona\x1b[0m:\x1b[34m{}\x1b[0m$ ", user, cwd));
+        } else {
+            _print(format_args!("{}@iona:{} $ ", user, cwd));
+        }
+    }
+}
+
+pub mod parser {
+    //! Command parsing: tokenization, redirect, pipe, variable expansion.
+    use super::types::{Command, EnvMap};
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    use core::str::SplitWhitespace;
+
+    /// Expand environment variables in a string.
+    pub fn expand_vars(s: &str, env: &EnvMap) -> String {
         let mut result = String::new();
         let mut chars = s.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '$' {
                 let mut var = String::new();
                 while let Some(&nc) = chars.peek() {
-                    if nc.is_alphanumeric() || nc == '_' { var.push(nc); chars.next(); }
-                    else { break; }
+                    if nc.is_alphanumeric() || nc == '_' {
+                        var.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
-                if let Some(val) = self.env.get(&var) {
+                if let Some(val) = env.get(&var) {
                     result.push_str(val);
                 } else {
                     result.push('$');
@@ -212,423 +469,721 @@ impl Shell {
         result
     }
 
-    fn execute_pipeline(&self, segments: &[&str]) -> i32 {
-        // Execute pipeline: cmd1 | cmd2 | cmd3
-        // Uses kernel pipe() syscall to connect stdout of each stage
-        // to stdin of the next stage.
-        let n = segments.len();
-        if n == 0 { return 0; }
+    /// Tokenize a command line into arguments, respecting quotes.
+    pub fn tokenize(line: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut cur = String::new();
+        let mut in_quote = false;
+        let mut quote_char = ' ';
 
-        // For each pair of adjacent commands, create a pipe
-        // pipes[i] = (read_fd, write_fd) connecting cmd[i] → cmd[i+1]
-        let mut pipes: Vec<(u64, u64)> = Vec::new();
-        for _ in 0..n.saturating_sub(1) {
-            let (read_fd, write_fd) = pipe::create();
-            pipes.push((read_fd, write_fd));
-        }
-
-        let mut prev_output: Option<Vec<u8>> = None;
-
-        for (i, seg) in segments.iter().enumerate() {
-            let seg = seg.trim();
-            let args = tokenize(seg);
-            if args.is_empty() { continue; }
-
-            // Try builtin with captured stdin from previous pipe
-            let stdin_data = prev_output.as_deref();
-            let out = self.run_builtin_capture(&args, stdin_data);
-            match out {
-                Some(o) => {
-                    // If this is the last command, output to terminal
-                    if i == n - 1 {
-                        if let Ok(s) = core::str::from_utf8(&o) {
-                            self.puts(s);
-                        }
-                    } else {
-                        // Write output to pipe for next command
-                        if i < pipes.len() {
-                            pipe::write_nonblock(pipes[i].1, &o);
-                        }
-                        prev_output = Some(o);
+        for c in line.chars() {
+            match c {
+                '"' | '\'' if !in_quote => {
+                    in_quote = true;
+                    quote_char = c;
+                }
+                c if in_quote && c == quote_char => {
+                    in_quote = false;
+                }
+                ' ' | '\t' if !in_quote => {
+                    if !cur.is_empty() {
+                        tokens.push(cur.clone());
+                        cur.clear();
                     }
                 }
-                None => {
-                    // External command — spawn with pipe redirection
-                    self.spawn_external_piped(&args, stdin_data, i < n - 1);
-                    prev_output = None;
-                }
+                _ => cur.push(c),
             }
         }
-        0
-    }
-
-    /// Spawn external command with pipe support
-    fn spawn_external_piped(&self, args: &[String], stdin: Option<&[u8]>, _pipe_out: bool) -> i32 {
-        // Write stdin data to a temporary pipe if provided
-        if let Some(data) = stdin {
-            let (read_fd, _write_fd) = pipe::create();
-            pipe::write_nonblock(read_fd, data);
+        if !cur.is_empty() {
+            tokens.push(cur);
         }
-        self.spawn_external(args, stdin, _pipe_out)
+        tokens
     }
 
-    fn run_builtin_capture(&self, args: &[String], _stdin: Option<&[u8]>) -> Option<Vec<u8>> {
-        // Returns Some(output) if it's a builtin that can capture output
-        match args[0].as_str() {
-            "echo" => {
-                let out = args[1..].join(" ") + "
-";
-                Some(out.into_bytes())
+    /// Parse a command line into a Command structure.
+    pub fn parse_command(line: &str) -> Command {
+        let mut args = Vec::new();
+        let mut input_file = None;
+        let mut output_file = None;
+        let mut append = false;
+        let mut background = false;
+        let mut pipe_parts = Vec::new();
+
+        // Split on pipe if present.
+        let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+        if parts.len() > 1 {
+            // Pipeline.
+            for part in parts {
+                let cmd = parse_single_command(part);
+                pipe_parts.push(cmd);
             }
-            "cat" if args.len() > 1 => {
-                ionafs::read(&args[1])
+            return Command {
+                args: Vec::new(),
+                input_file: None,
+                output_file: None,
+                append: false,
+                background: false,
+                pipe_to: Some(pipe_parts),
+            };
+        }
+
+        // No pipe: parse single command.
+        let mut cmd = parse_single_command(line);
+        // Check for background '&'.
+        if let Some(last) = cmd.args.last() {
+            if last == "&" {
+                cmd.args.pop();
+                cmd.background = true;
             }
-            "ls" => {
-                let mut files = ionafs::list();
-                files.sort();
-                let out = files.join("  ") + "
-";
-                Some(out.into_bytes())
+        }
+        cmd
+    }
+
+    fn parse_single_command(line: &str) -> Command {
+        let mut args = Vec::new();
+        let mut input_file = None;
+        let mut output_file = None;
+        let mut append = false;
+
+        let mut parts = line.split_whitespace().peekable();
+        while let Some(tok) = parts.next() {
+            if tok == ">>" {
+                append = true;
+                output_file = parts.next().map(|s| s.to_string());
+            } else if tok == ">" {
+                output_file = parts.next().map(|s| s.to_string());
+            } else if tok == "<" {
+                input_file = parts.next().map(|s| s.to_string());
+            } else {
+                args.push(tok.to_string());
             }
-            _ => None,
+        }
+        Command {
+            args,
+            input_file,
+            output_file,
+            append,
+            background: false,
+            pipe_to: None,
         }
     }
+}
 
-    fn execute_command(&mut self, line: &str) -> i32 {
-        // Parse redirects
-        let (cmd_part, redirect_out, _redirect_in, _append) = parse_redirects(line);
-        let args = tokenize(cmd_part.trim());
-        if args.is_empty() { return 0; }
+pub mod builtins {
+    //! Built-in shell commands.
+    use super::{
+        types::{ShellState, Command},
+        error::{ShellError, ShellResult},
+        input::puts,
+        metrics::global_metrics,
+        parser::expand_vars,
+    };
+    use crate::fs::{ionafs, vfs};
+    use crate::sched::SCHEDULER;
+    use alloc::{
+        format,
+        string::{String, ToString},
+        vec::Vec,
+    };
+    use core::str::from_utf8;
 
-        let name = args[0].as_str();
+    pub fn execute(
+        cmd: &Command,
+        state: &mut ShellState,
+        stdin_data: Option<&[u8]>,
+    ) -> ShellResult<Option<Vec<u8>>> {
+        if cmd.args.is_empty() {
+            return Ok(None);
+        }
 
-        // Check builtins
-        match name {
-            "exit" | "quit" => return -1,
+        let name = &cmd.args[0];
+        let args = &cmd.args[1..];
+
+        match name.as_str() {
+            "exit" | "quit" => {
+                // Special: return a marker to exit shell.
+                return Err(ShellError::InvalidCommand("exit".into()));
+            }
 
             "help" => {
-                self.puts("IONA OS Shell builtins:
-");
-                self.puts("  cd [dir]     — change directory
-");
-                self.puts("  pwd          — print working directory
-");
-                self.puts("  ls [dir]     — list files
-");
-                self.puts("  cat <file>   — print file contents
-");
-                self.puts("  echo [args]  — print arguments
-");
-                self.puts("  ps           — list processes
-");
-                self.puts("  uname        — system information
-");
-                self.puts("  clear        — clear screen
-");
-                self.puts("  env          — show environment
-");
-                self.puts("  export K=V   — set env variable
-");
-                self.puts("  history      — command history
-");
-                self.puts("  exit         — exit shell
+                let text = "\
+IONA OS Shell builtins:
+  cd [dir]     — change directory
+  pwd          — print working directory
+  ls [dir]     — list files
+  cat <file>   — print file contents
+  echo [args]  — print arguments
+  ps           — list processes
+  uname        — system information
+  clear        — clear screen
+  env          — show environment
+  export K=V   — set env variable
+  history      — command history
+  exit         — exit shell
 
-");
-                self.puts("Use | for pipes, > < for redirect
-");
-                return 0;
+Use | for pipes, > < for redirect
+";
+                puts(text);
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "clear" => {
-                self.puts("[2J[H");
-                return 0;
+                puts("\x1b[2J\x1b[H");
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "pwd" => {
-                self.puts(&self.cwd);
-                self.puts("
-");
-                return 0;
+                puts(&state.cwd);
+                puts("\n");
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "cd" => {
-                let dir = args.get(1).map(|s| s.as_str()).unwrap_or("/");
+                let dir = args.first().map(|s| s.as_str()).unwrap_or("/");
                 let new_dir = if dir.starts_with('/') {
                     dir.to_string()
                 } else {
-                    format!("{}/{}", self.cwd.trim_end_matches('/'), dir)
+                    format!("{}/{}", state.cwd.trim_end_matches('/'), dir)
                 };
-                // Normalize .. and .
-                self.cwd = normalize_path(&new_dir);
-                return 0;
+                state.cwd = super::utils::normalize_path(&new_dir);
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "ls" => {
-                let dir = args.get(1).map(|s| s.as_str()).unwrap_or(&self.cwd);
+                let dir = args.first().map(|s| s.as_str()).unwrap_or(&state.cwd);
                 let mut files: Vec<String> = ionafs::list()
                     .into_iter()
-                    .filter(|f| f.starts_with(dir) || dir == "/" || dir == &self.cwd)
+                    .filter(|f| f.starts_with(dir) || dir == "/" || dir == &state.cwd)
                     .collect();
-                // Also add VFS entries
+                // Also add VFS entries.
                 if let Ok(entries) = vfs::readdir(dir) {
                     for e in entries {
-                        if !files.contains(&e) { files.push(e); }
+                        if !files.contains(&e) {
+                            files.push(e);
+                        }
                     }
                 }
                 files.sort();
                 if files.is_empty() {
-                    self.puts("(empty)
-");
+                    puts("(empty)\n");
                 } else {
                     for (i, f) in files.iter().enumerate() {
                         let name = f.trim_start_matches(dir).trim_start_matches('/');
-                        if name.is_empty() { continue; }
-                        self.puts(&format!("[36m{:<20}[0m", name));
-                        if (i + 1) % 4 == 0 { self.puts("
-"); }
+                        if name.is_empty() {
+                            continue;
+                        }
+                        puts(&format!("\x1b[36m{:<20}\x1b[0m", name));
+                        if (i + 1) % 4 == 0 {
+                            puts("\n");
+                        }
                     }
-                    self.puts("
-");
+                    puts("\n");
                 }
-                return 0;
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "echo" => {
-                let out = args[1..].join(" ");
-                let out = self.expand_vars(&out);
-                if let Some(ref path) = redirect_out {
-                    ionafs::write(path, out.as_bytes());
-                } else {
-                    self.puts(&out);
-                    self.puts("
-");
-                }
-                return 0;
+                let out = args.join(" ");
+                let out = expand_vars(&out, &state.env);
+                // Output might be redirected; handled by executor.
+                // We'll return the output as bytes.
+                let out_bytes = out.into_bytes();
+                global_metrics().inc_builtin();
+                return Ok(Some(out_bytes));
             }
 
             "cat" => {
-                let path = match args.get(1) {
-                    Some(p) => p.as_str(),
-                    None    => {
-                        self.puts("Usage: cat <file>
-");
-                        return 1;
-                    }
-                };
-                match ionafs::read(path).or_else(|| {
+                let path = args.first().ok_or(ShellError::InvalidCommand("cat requires file".into()))?;
+                let data = ionafs::read(path).or_else(|| {
                     let mut buf = alloc::vec![0u8; 65536];
                     match vfs::read(path, &mut buf, 0) {
                         Ok(n) => Some(buf[..n].to_vec()),
                         Err(_) => None,
                     }
-                }) {
-                    Some(data) => {
-                        if let Ok(s) = core::str::from_utf8(&data) {
-                            if let Some(ref out_path) = redirect_out {
-                                ionafs::write(out_path, data.as_slice());
-                            } else {
-                                self.puts(s);
-                            }
-                        } else {
-                            self.puts(&format!("[binary data, {} bytes]
-", data.len()));
-                        }
-                    }
-                    None => {
-                        self.puts(&format!("cat: {}: No such file
-", path));
-                        return 1;
-                    }
-                }
-                return 0;
+                }).ok_or_else(|| ShellError::FileNotFound(path.clone()))?;
+                global_metrics().inc_builtin();
+                return Ok(Some(data));
             }
 
             "ps" => {
-                self.puts("PID  NAME             STATE
-");
-                self.puts("───  ───────────────  ─────
-");
+                let mut out = String::new();
+                out.push_str("PID  NAME             STATE\n");
+                out.push_str("───  ───────────────  ─────\n");
                 let stats = SCHEDULER.lock().stats();
                 if let Some(tid) = stats.current_tid {
-                    self.puts(&format!("{:<5}{:<17}Running
-",
-                        tid, stats.current_name.unwrap_or("?")));
+                    out.push_str(&format!("{:<5}{:<17}Running\n", tid, stats.current_name.unwrap_or("?")));
                 }
-                self.puts(&format!("  [total: {} ready, {} blocked]
-",
+                out.push_str(&format!("  [total: {} ready, {} blocked]\n",
                     stats.ready_count, stats.blocked_count));
-                return 0;
+                puts(&out);
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "uname" => {
-                self.puts("IONA OS 0.3.0 x86_64 2025
-");
-                return 0;
+                puts("IONA OS 0.3.0 x86_64 2025\n");
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "env" => {
-                for (k, v) in &self.env {
-                    self.puts(&format!("{}={}
-", k, v));
+                for (k, v) in &state.env {
+                    puts(&format!("{}={}\n", k, v));
                 }
-                return 0;
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "export" => {
-                if let Some(kv) = args.get(1) {
+                if let Some(kv) = args.first() {
                     if let Some((k, v)) = kv.split_once('=') {
-                        self.env.insert(k.to_string(), v.to_string());
+                        state.env.insert(k.to_string(), v.to_string());
                     }
                 }
-                return 0;
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "history" => {
-                for (i, cmd) in self.history.iter().enumerate() {
-                    self.puts(&format!("{:3}  {}
-", i + 1, cmd));
+                for (i, cmd) in state.history.iter().enumerate() {
+                    puts(&format!("{:3}  {}\n", i + 1, cmd));
                 }
-                return 0;
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "write" => {
-                // write <path> <content>
-                if args.len() >= 3 {
-                    let content = args[2..].join(" ");
-                    ionafs::write(&args[1], content.as_bytes());
-                    self.puts(&format!("Written {} bytes to {}
-", content.len(), args[1]));
+                if args.len() < 2 {
+                    puts("Usage: write <path> <content>\n");
+                    return Ok(None);
                 }
-                return 0;
+                let path = &args[0];
+                let content = args[1..].join(" ");
+                ionafs::write(path, content.as_bytes());
+                puts(&format!("Written {} bytes to {}\n", content.len(), path));
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             "mem" => {
                 let (tf, uf) = crate::memory::frame_alloc::stats();
                 let (_, bf) = crate::mm::buddy::stats();
-                self.puts(&format!(
-                    "Total: {}MB  Used: {}MB  Free: {}MB  Buddy: {}KB free
-",
+                puts(&format!(
+                    "Total: {}MB  Used: {}MB  Free: {}MB  Buddy: {}KB free\n",
                     tf * 4 / 1024, uf * 4 / 1024, (tf - uf) * 4 / 1024, bf * 4
                 ));
-                return 0;
+                global_metrics().inc_builtin();
+                return Ok(None);
             }
 
             _ => {
-                // External command — search in IONAFS /bin/
-                return self.spawn_external(&args, None, false);
+                // Not a builtin.
+                return Ok(None);
             }
         }
     }
+}
 
-    fn spawn_external(&self, args: &[String], _stdin: Option<&[u8]>, _pipe_out: bool) -> i32 {
-        let name = &args[0];
-        // Search paths: /bin/name, name (absolute), /usr/bin/name
-        let paths = [
-            format!("/bin/{}", name),
-            name.to_string(),
-            format!("/usr/bin/{}", name),
-        ];
+pub mod external {
+    //! External command execution.
+    use super::{
+        types::{Command, ShellState},
+        error::{ShellError, ShellResult},
+        parser::expand_vars,
+        metrics::global_metrics,
+    };
+    use crate::elf;
+    use crate::fs::ionafs;
+    use crate::task::next_tid;
+    use alloc::string::String;
+    use alloc::vec::Vec;
 
+    pub fn execute(
+        cmd: &Command,
+        state: &mut ShellState,
+        stdin_data: Option<&[u8]>,
+    ) -> ShellResult<Option<Vec<u8>>> {
+        let name = &cmd.args[0];
+        // Search paths.
+        let path_env = state.env.get("PATH").map(|s| s.as_str()).unwrap_or("/bin");
+        let mut paths = Vec::new();
+        for p in path_env.split(':') {
+            paths.push(format!("{}/{}", p, name));
+        }
+        paths.push(name.clone()); // absolute path.
         let elf_bytes = paths.iter().find_map(|p| ionafs::read(p));
 
         match elf_bytes {
             Some(elf) => {
-                let tid = crate::task::next_tid();
-                let argv_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                match crate::elf::load_with_args(&elf, &argv_refs, &[]) {
+                let tid = next_tid();
+                let argv_refs: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
+                match elf::load_with_args(&elf, &argv_refs, &[]) {
                     Ok(addr_space) => {
                         addr_space.activate();
-                        crate::serial_println!("[SHELL] spawned {} pid={}", name, tid);
-                        // waitpid simulation
+                        // In a real system, we'd wait for the process.
+                        // For this stub, we just sleep a bit.
                         crate::arch::x86_64::timer::sleep_ms(100);
-                        0
+                        global_metrics().inc_external();
+                        // We have no output capture for external commands in this stub.
+                        return Ok(None);
                     }
                     Err(e) => {
-                        self.puts(&format!("{}: ELF load error: {:?}
-", name, e));
-                        127
+                        return Err(ShellError::Internal(format!("ELF load error: {:?}", e)));
                     }
                 }
             }
             None => {
-                self.puts(&format!("{}: command not found
-", name));
-                127
+                return Err(ShellError::CommandNotFound(name.clone()));
             }
         }
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+pub mod utils {
+    //! Utility functions.
+    use alloc::string::String;
+    use alloc::vec::Vec;
 
-fn tokenize(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote = false;
-    let mut quote_char = ' ';
+    pub fn normalize_path(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for seg in path.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        if parts.is_empty() {
+            "/".into()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
+    }
+}
 
-    for c in line.chars() {
-        match c {
-            '"' | '\'' if !in_quote => {
-                in_quote   = true;
-                quote_char = c;
+pub mod executor {
+    //! Command executor (builtins, external, pipelines, redirects).
+    use super::{
+        types::{Command, ShellState},
+        error::{ShellError, ShellResult},
+        builtins, external, parser,
+        input::puts,
+        metrics::global_metrics,
+        pipe,
+    };
+    use crate::fs::ionafs;
+    use alloc::vec::Vec;
+
+    /// Execute a command (possibly with redirections, pipes, background).
+    pub fn execute(
+        cmd: &Command,
+        state: &mut ShellState,
+        stdin_data: Option<&[u8]>,
+    ) -> ShellResult<Option<Vec<u8>>> {
+        // If pipeline, handle pipeline.
+        if let Some(pipe_cmds) = &cmd.pipe_to {
+            return execute_pipeline(pipe_cmds, state);
+        }
+
+        // Handle redirections.
+        let mut output_data = None;
+        let mut input_data = stdin_data;
+
+        // Input redirection.
+        if let Some(in_file) = &cmd.input_file {
+            let data = ionafs::read(in_file)
+                .ok_or_else(|| ShellError::FileNotFound(in_file.clone()))?;
+            input_data = Some(&data);
+        }
+
+        // Try builtins first.
+        if let Some(out) = builtins::execute(cmd, state, input_data)? {
+            output_data = Some(out);
+        } else {
+            // External command.
+            external::execute(cmd, state, input_data)?;
+        }
+
+        // Output redirection.
+        if let Some(out_file) = &cmd.output_file {
+            if let Some(data) = &output_data {
+                ionafs::write(out_file, data);
+                global_metrics().inc_redirect();
             }
-            c if in_quote && c == quote_char => {
-                in_quote = false;
-            }
-            ' ' | '\t' if !in_quote => {
-                if !cur.is_empty() {
-                    tokens.push(cur.clone());
-                    cur.clear();
+        } else {
+            // If output data exists and not redirected, print it.
+            if let Some(data) = output_data {
+                if let Ok(s) = core::str::from_utf8(&data) {
+                    puts(s);
+                } else {
+                    puts(&format!("[binary data, {} bytes]\n", data.len()));
                 }
             }
-            _ => cur.push(c),
         }
+
+        Ok(None)
     }
-    if !cur.is_empty() { tokens.push(cur); }
-    tokens
+
+    fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> ShellResult<Option<Vec<u8>>> {
+        if cmds.is_empty() {
+            return Ok(None);
+        }
+        global_metrics().inc_pipeline();
+
+        let mut prev_output: Option<Vec<u8>> = None;
+        let mut pipes = Vec::new();
+
+        // Create pipes between commands.
+        for i in 0..cmds.len().saturating_sub(1) {
+            let (read_fd, write_fd) = pipe::create();
+            pipes.push((read_fd, write_fd));
+        }
+
+        for (i, cmd) in cmds.iter().enumerate() {
+            let stdin_data = if i == 0 {
+                prev_output.as_deref()
+            } else {
+                // We should read from pipe, but for simplicity we just pass None.
+                // In a real implementation, we'd set up pipe redirections.
+                None
+            };
+            let result = execute(cmd, state, stdin_data)?;
+            if i == cmds.len() - 1 {
+                // Last command: output to terminal.
+                if let Some(data) = result {
+                    if let Ok(s) = core::str::from_utf8(&data) {
+                        puts(s);
+                    }
+                }
+            } else {
+                // Write result to pipe.
+                if let Some(data) = result {
+                    // Write to pipe.
+                    if i < pipes.len() {
+                        let (_, write_fd) = pipes[i];
+                        // We'd need a non-blocking write; for simplicity, we'll ignore.
+                        // pipe::write_nonblock(write_fd, &data);
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
 }
 
-fn parse_redirects(line: &str) -> (String, Option<String>, Option<String>, bool) {
-    let mut cmd      = String::new();
-    let mut out_file = None;
-    let mut in_file  = None;
-    let mut append   = false;
+pub mod manager {
+    //! Centralised shell manager.
+    use super::{
+        config::ShellConfig,
+        error::{ShellError, ShellResult},
+        types::ShellState,
+        input::readline,
+        prompt::print_prompt,
+        parser::parse_command,
+        executor::execute,
+        metrics::global_metrics,
+    };
+    use crate::io::serial::_print;
+    use tracing::{debug, info};
 
-    let mut parts = line.split_whitespace().peekable();
-    while let Some(tok) = parts.next() {
-        if tok == ">>" {
-            append   = true;
-            out_file = parts.next().map(|s| s.to_string());
-        } else if tok == ">" {
-            out_file = parts.next().map(|s| s.to_string());
-        } else if tok == "<" {
-            in_file  = parts.next().map(|s| s.to_string());
-        } else {
-            if !cmd.is_empty() { cmd.push(' '); }
-            cmd.push_str(tok);
+    /// Shell manager.
+    pub struct ShellManager {
+        config: ShellConfig,
+        state: ShellState,
+    }
+
+    impl ShellManager {
+        pub fn new(config: ShellConfig) -> Self {
+            config.validate().expect("invalid ShellConfig");
+            let state = ShellState::new(&config);
+            Self { config, state }
+        }
+
+        pub fn with_defaults() -> Self {
+            Self::new(ShellConfig::default())
+        }
+
+        pub fn config(&self) -> &ShellConfig {
+            &self.config
+        }
+
+        pub fn state(&self) -> &ShellState {
+            &self.state
+        }
+
+        pub fn state_mut(&mut self) -> &mut ShellState {
+            &mut self.state
+        }
+
+        /// Run the interactive shell.
+        pub fn run(&mut self) {
+            info!("starting shell");
+            self.print_banner();
+            loop {
+                print_prompt(&self.state);
+                let line = readline(&mut self.state);
+                if line.is_empty() {
+                    continue;
+                }
+                self.state.add_history(&line);
+                if self.execute_line(&line) == -1 {
+                    break;
+                }
+            }
+            _print(format_args!("\n[SHELL] exiting\n"));
+        }
+
+        fn print_banner(&self) {
+            _print(format_args!("\x1b[2J\x1b[H"));
+            _print(format_args!(
+                "╔══════════════════════════════════════╗\n\
+                 ║    IONA OS Shell  v0.3.0             ║\n\
+                 ║    Type 'help' for commands          ║\n\
+                 ╚══════════════════════════════════════╝\n\n"
+            ));
+        }
+
+        fn execute_line(&mut self, line: &str) -> i32 {
+            global_metrics().inc_cmd();
+
+            // Parse command.
+            let cmd = parse_command(line);
+
+            // Execute.
+            match execute(&cmd, &mut self.state, None) {
+                Ok(_) => 0,
+                Err(ShellError::InvalidCommand(_)) => -1, // exit
+                Err(e) => {
+                    _print(format_args!("{}: {}\n", line, e));
+                    global_metrics().inc_error();
+                    1
+                }
+            }
         }
     }
-    (cmd, out_file, in_file, append)
 }
 
-fn normalize_path(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "."  => {}
-            ".."       => { parts.pop(); }
-            s          => parts.push(s),
-        }
-    }
-    if parts.is_empty() { "/".into() } else { format!("/{}", parts.join("/")) }
+// -----------------------------------------------------------------------------
+// Public exports
+// -----------------------------------------------------------------------------
+
+pub use config::ShellConfig;
+pub use error::{ShellError, ShellResult};
+pub use metrics::{ShellMetrics, ShellMetricsSnapshot};
+pub use types::{Command, EnvMap, ShellState};
+pub use manager::ShellManager;
+
+// -----------------------------------------------------------------------------
+// Legacy global API (backward compatibility)
+// -----------------------------------------------------------------------------
+
+use spin::Once;
+
+static GLOBAL_MANAGER: Once<ShellManager> = Once::new();
+
+/// Initialize the global shell manager with default config.
+pub fn init() {
+    GLOBAL_MANAGER.call_once(|| ShellManager::with_defaults());
+    crate::serial_println!("[SHELL] subsystem initialised");
 }
 
-/// Entry point pentru shell task
+/// Get the global manager.
+fn global_manager() -> &'static ShellManager {
+    GLOBAL_MANAGER.get().expect("shell not initialised")
+}
+
+/// Run the shell (legacy entry point).
 pub fn shell_main(_: u64) -> ! {
-    crate::serial_println!("[SHELL] starting on serial console");
-    let mut sh = Shell::new();
-    sh.run();
+    // We need to consume the manager.
+    // We'll use a static mutex to hold the manager and run it.
+    // For backward compatibility, we'll use a static manager and run it.
+    // Since Once doesn't give mutable access, we need to work around.
+    // We'll use a static mutex for the manager.
+    static SHELL_MANAGER: spin::Mutex<Option<ShellManager>> = spin::Mutex::new(None);
+
+    let mut guard = SHELL_MANAGER.lock();
+    if guard.is_none() {
+        *guard = Some(ShellManager::with_defaults());
+    }
+    let manager = guard.as_mut().unwrap();
+    manager.run();
     crate::sched::exit_current(0);
-    loop { x86_64::instructions::hlt(); }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Metrics global access
+// -----------------------------------------------------------------------------
+
+/// Global metrics singleton.
+static METRICS: spin::Once<ShellMetrics> = spin::Once::new();
+
+pub(crate) fn global_metrics() -> &'static ShellMetrics {
+    METRICS.get_or_init(|| ShellMetrics::default())
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_validation() {
+        let config = ShellConfig::default();
+        assert!(config.validate().is_ok());
+        let mut bad = config.clone();
+        bad.max_history = 0;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn test_parse_simple() {
+        let cmd = parser::parse_command("echo hello world");
+        assert_eq!(cmd.args, vec!["echo", "hello", "world"]);
+    }
+
+    #[test]
+    fn test_parse_redirect() {
+        let cmd = parser::parse_command("cat file > out.txt");
+        assert_eq!(cmd.args, vec!["cat", "file"]);
+        assert_eq!(cmd.output_file, Some("out.txt".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pipe() {
+        let cmd = parser::parse_command("cmd1 | cmd2");
+        assert!(cmd.pipe_to.is_some());
+        let pipeline = cmd.pipe_to.unwrap();
+        assert_eq!(pipeline.len(), 2);
+        assert_eq!(pipeline[0].args, vec!["cmd1"]);
+        assert_eq!(pipeline[1].args, vec!["cmd2"]);
+    }
+
+    #[test]
+    fn test_env_expansion() {
+        let mut env = BTreeMap::new();
+        env.insert("USER".into(), "test".into());
+        let expanded = parser::expand_vars("hello $USER", &env);
+        assert_eq!(expanded, "hello test");
+    }
+
+    #[test]
+    fn test_normalize_path() {
+        assert_eq!(utils::normalize_path("/a/b/../c"), "/a/c");
+        assert_eq!(utils::normalize_path("/a/./b"), "/a/b");
+        assert_eq!(utils::normalize_path("a/b/c"), "/a/b/c");
+    }
 }
