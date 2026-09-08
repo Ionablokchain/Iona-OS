@@ -7,6 +7,9 @@
 //! - Evidence detection and reporting
 //! - Block store and outbox abstractions
 //! - Kernel‑level integration via syscall 400
+//! - Prometheus metrics for observability
+//! - Overflow‑safe counters using saturating arithmetic
+//! - Config validation
 //!
 //! # Example
 //!
@@ -32,7 +35,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::marker::PhantomData;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -71,6 +79,10 @@ pub enum ConsensusError {
     NoProposer,
     #[error("I/O error: {0}")]
     Io(String),
+    #[error("metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
+    #[error("integer overflow")]
+    IntegerOverflow,
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -123,7 +135,7 @@ impl CommitCertificate {
             let bytes = vote_sign_bytes(vote.vote_type, vote.height, vote.round, &vote.block_id);
             V::verify(&vote.voter, &bytes, &vote.signature)
                 .map_err(|_| ConsensusError::BadSignature)?;
-            power += vset.power_of(&vote.voter);
+            power = power.saturating_add(vset.power_of(&vote.voter));
         }
         if power < q {
             return Err(ConsensusError::QuorumNotReached);
@@ -149,6 +161,8 @@ pub struct Config {
     pub include_block_in_proposal: bool,
     /// Advance step immediately on quorum — key to sub‑second finality.
     pub fast_quorum: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for Config {
@@ -163,6 +177,110 @@ impl Default for Config {
             initial_base_fee_per_gas: 1,
             include_block_in_proposal: true,
             fast_quorum: true,
+            enable_metrics: false,
+        }
+    }
+}
+
+impl Config {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.propose_timeout_ms == 0 {
+            return Err("propose_timeout_ms must be > 0".into());
+        }
+        if self.prevote_timeout_ms == 0 {
+            return Err("prevote_timeout_ms must be > 0".into());
+        }
+        if self.precommit_timeout_ms == 0 {
+            return Err("precommit_timeout_ms must be > 0".into());
+        }
+        if self.max_rounds == 0 {
+            return Err("max_rounds must be > 0".into());
+        }
+        if self.max_txs_per_block == 0 {
+            return Err("max_txs_per_block must be > 0".into());
+        }
+        if self.gas_target == 0 {
+            return Err("gas_target must be > 0".into());
+        }
+        if self.initial_base_fee_per_gas == 0 {
+            return Err("initial_base_fee_per_gas must be > 0".into());
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Consensus Metrics (Prometheus)
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the consensus engine.
+#[derive(Clone)]
+pub struct ConsensusMetrics {
+    /// Current consensus height.
+    pub current_height: Gauge,
+    /// Current consensus round.
+    pub current_round: Gauge,
+    /// Current step (0=Propose, 1=Prevote, 2=Precommit, 3=Commit).
+    pub current_step: Gauge,
+    /// Total proposals broadcast.
+    pub proposals_broadcast_total: Counter,
+    /// Total proposals received.
+    pub proposals_received_total: Counter,
+    /// Total votes broadcast.
+    pub votes_broadcast_total: Counter,
+    /// Total votes received.
+    pub votes_received_total: Counter,
+    /// Total blocks committed.
+    pub blocks_committed_total: Counter,
+    /// Total round advancements.
+    pub round_advancements_total: Counter,
+    /// Total double‑sign evidence detected.
+    pub double_sign_evidence_total: Counter,
+    /// Total block requests sent.
+    pub block_requests_total: Counter,
+    /// Current base fee per gas.
+    pub base_fee_per_gas: Gauge,
+    /// Current step elapsed time (ms).
+    pub step_elapsed_ms: Gauge,
+}
+
+impl ConsensusMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            current_height: register_gauge!("iona_consensus_height", "Current consensus height")?,
+            current_round: register_gauge!("iona_consensus_round", "Current consensus round")?,
+            current_step: register_gauge!("iona_consensus_step", "Current consensus step (0=Propose,1=Prevote,2=Precommit,3=Commit)")?,
+            proposals_broadcast_total: register_counter!("iona_consensus_proposals_broadcast_total", "Total proposals broadcast")?,
+            proposals_received_total: register_counter!("iona_consensus_proposals_received_total", "Total proposals received")?,
+            votes_broadcast_total: register_counter!("iona_consensus_votes_broadcast_total", "Total votes broadcast")?,
+            votes_received_total: register_counter!("iona_consensus_votes_received_total", "Total votes received")?,
+            blocks_committed_total: register_counter!("iona_consensus_blocks_committed_total", "Total blocks committed")?,
+            round_advancements_total: register_counter!("iona_consensus_round_advancements_total", "Total round advancements")?,
+            double_sign_evidence_total: register_counter!("iona_consensus_double_sign_evidence_total", "Total double-sign evidence detected")?,
+            block_requests_total: register_counter!("iona_consensus_block_requests_total", "Total block requests sent")?,
+            base_fee_per_gas: register_gauge!("iona_consensus_base_fee_per_gas", "Current base fee per gas")?,
+            step_elapsed_ms: register_gauge!("iona_consensus_step_elapsed_ms", "Current step elapsed time in milliseconds")?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            current_height: Gauge::new("iona_consensus_height", "Height").unwrap(),
+            current_round: Gauge::new("iona_consensus_round", "Round").unwrap(),
+            current_step: Gauge::new("iona_consensus_step", "Step").unwrap(),
+            proposals_broadcast_total: Counter::new("iona_consensus_proposals_broadcast_total", "Proposals").unwrap(),
+            proposals_received_total: Counter::new("iona_consensus_proposals_received_total", "Proposals received").unwrap(),
+            votes_broadcast_total: Counter::new("iona_consensus_votes_broadcast_total", "Votes").unwrap(),
+            votes_received_total: Counter::new("iona_consensus_votes_received_total", "Votes received").unwrap(),
+            blocks_committed_total: Counter::new("iona_consensus_blocks_committed_total", "Committed").unwrap(),
+            round_advancements_total: Counter::new("iona_consensus_round_advancements_total", "Round advancements").unwrap(),
+            double_sign_evidence_total: Counter::new("iona_consensus_double_sign_evidence_total", "Double sign").unwrap(),
+            block_requests_total: Counter::new("iona_consensus_block_requests_total", "Block requests").unwrap(),
+            base_fee_per_gas: Gauge::new("iona_consensus_base_fee_per_gas", "Base fee").unwrap(),
+            step_elapsed_ms: Gauge::new("iona_consensus_step_elapsed_ms", "Elapsed").unwrap(),
         }
     }
 }
@@ -213,7 +331,7 @@ impl ConsensusState {
 
     /// Advance to the next round.
     pub fn advance_round(&mut self) {
-        self.round += 1;
+        self.round = self.round.saturating_add(1);
         self.proposal = None;
         self.proposal_block = None;
         self.step = Step::Propose;
@@ -263,7 +381,23 @@ pub struct Engine<V: Verifier> {
     pub base_fee_per_gas: u64,
     ds_guard: Option<DoubleSignGuard>,
     step_elapsed_ms: u64,
+    metrics: Option<Arc<ConsensusMetrics>>,
+    // Atomic fallback metrics
+    atomic_metrics: Arc<AtomicConsensusMetrics>,
     _v: PhantomData<V>,
+}
+
+/// Atomic fallback metrics.
+#[derive(Debug, Default)]
+pub struct AtomicConsensusMetrics {
+    pub proposals_broadcast: AtomicU64,
+    pub proposals_received: AtomicU64,
+    pub votes_broadcast: AtomicU64,
+    pub votes_received: AtomicU64,
+    pub blocks_committed: AtomicU64,
+    pub round_advancements: AtomicU64,
+    pub double_sign_evidence: AtomicU64,
+    pub block_requests: AtomicU64,
 }
 
 impl<V: Verifier> Engine<V> {
@@ -276,8 +410,14 @@ impl<V: Verifier> Engine<V> {
         app_state: KvState,
         stakes: StakeLedger,
         ds_guard: Option<DoubleSignGuard>,
-    ) -> Self {
-        Self {
+    ) -> ConsensusResult<Self> {
+        cfg.validate().map_err(ConsensusError::Config)?;
+        let metrics = if cfg.enable_metrics {
+            Some(Arc::new(ConsensusMetrics::new()?))
+        } else {
+            None
+        };
+        Ok(Self {
             base_fee_per_gas: cfg.initial_base_fee_per_gas,
             cfg,
             vset,
@@ -287,8 +427,10 @@ impl<V: Verifier> Engine<V> {
             stakes,
             step_elapsed_ms: 0,
             ds_guard,
+            metrics,
+            atomic_metrics: Arc::new(AtomicConsensusMetrics::default()),
             _v: PhantomData,
-        }
+        })
     }
 
     /// Check if the local node is the proposer for the current height and round.
@@ -299,6 +441,46 @@ impl<V: Verifier> Engine<V> {
     /// Derive an address string from a public key (for execution).
     fn proposer_addr_string(&self, pk: &PublicKeyBytes) -> String {
         crate::crypto::tx::derive_address(&pk.0)
+    }
+
+    /// Get atomic metrics (always available).
+    pub fn atomic_metrics(&self) -> &AtomicConsensusMetrics {
+        &self.atomic_metrics
+    }
+
+    /// Get Prometheus metrics snapshot (if enabled).
+    pub fn metrics_snapshot(&self) -> Option<ConsensusMetricsSnapshot> {
+        self.metrics.as_ref().map(|m| ConsensusMetricsSnapshot {
+            current_height: m.current_height.get(),
+            current_round: m.current_round.get(),
+            current_step: m.current_step.get(),
+            proposals_broadcast_total: m.proposals_broadcast_total.get(),
+            proposals_received_total: m.proposals_received_total.get(),
+            votes_broadcast_total: m.votes_broadcast_total.get(),
+            votes_received_total: m.votes_received_total.get(),
+            blocks_committed_total: m.blocks_committed_total.get(),
+            round_advancements_total: m.round_advancements_total.get(),
+            double_sign_evidence_total: m.double_sign_evidence_total.get(),
+            block_requests_total: m.block_requests_total.get(),
+            base_fee_per_gas: m.base_fee_per_gas.get(),
+            step_elapsed_ms: m.step_elapsed_ms.get(),
+        })
+    }
+
+    /// Update metrics gauges.
+    fn update_metrics(&self) {
+        if let Some(m) = &self.metrics {
+            m.current_height.set(self.state.height as f64);
+            m.current_round.set(self.state.round as f64);
+            m.current_step.set(match self.state.step {
+                Step::Propose => 0.0,
+                Step::Prevote => 1.0,
+                Step::Precommit => 2.0,
+                Step::Commit => 3.0,
+            });
+            m.base_fee_per_gas.set(self.base_fee_per_gas as f64);
+            m.step_elapsed_ms.set(self.step_elapsed_ms as f64);
+        }
     }
 
     /// Main tick function – call periodically with elapsed milliseconds.
@@ -314,6 +496,7 @@ impl<V: Verifier> Engine<V> {
             return;
         }
         self.step_elapsed_ms = self.step_elapsed_ms.saturating_add(dt_ms);
+        self.update_metrics();
 
         match self.state.step {
             Step::Propose => {
@@ -335,6 +518,7 @@ impl<V: Verifier> Engine<V> {
                         }
                     });
                     self.broadcast_vote(signer, out, VoteType::Prevote, vote_block);
+                    self.update_metrics();
                 }
             }
             Step::Prevote => {
@@ -364,8 +548,12 @@ impl<V: Verifier> Engine<V> {
         }
         self.state.advance_round();
         self.step_elapsed_ms = 0;
+        self.atomic_metrics.round_advancements.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.round_advancements_total.inc();
+        }
         debug!(height = self.state.height, round = self.state.round, "advanced round");
-        // Try to propose immediately in the new round if we are the proposer.
+        self.update_metrics();
         self.maybe_propose(signer, store, out, |_| Vec::new());
     }
 
@@ -399,7 +587,6 @@ impl<V: Verifier> Engine<V> {
         let bid = block.id();
         store.put(block.clone());
 
-        // Double‑sign check before proposal.
         if let Some(g) = &self.ds_guard {
             if g.check_proposal(self.state.height, self.state.round, &bid).is_err() {
                 warn!(height = self.state.height, round = self.state.round, "ds_guard refused proposal");
@@ -434,7 +621,12 @@ impl<V: Verifier> Engine<V> {
         self.state.proposal = Some(prop.clone());
         self.state.proposal_block = Some(block);
         out.broadcast(ConsensusMsg::Proposal(prop));
+        self.atomic_metrics.proposals_broadcast.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.proposals_broadcast_total.inc();
+        }
         info!(height = self.state.height, round = self.state.round, "broadcast proposal");
+        self.update_metrics();
     }
 
     /// Handle an incoming consensus message.
@@ -446,9 +638,25 @@ impl<V: Verifier> Engine<V> {
         msg: ConsensusMsg,
     ) -> ConsensusResult<()> {
         match msg {
-            ConsensusMsg::Proposal(p) => self.on_proposal(signer, store, out, p),
-            ConsensusMsg::Vote(v) => self.on_vote(signer, store, out, v),
+            ConsensusMsg::Proposal(p) => {
+                self.atomic_metrics.proposals_received.fetch_add(1, Ordering::Relaxed);
+                if let Some(m) = &self.metrics {
+                    m.proposals_received_total.inc();
+                }
+                self.on_proposal(signer, store, out, p)
+            }
+            ConsensusMsg::Vote(v) => {
+                self.atomic_metrics.votes_received.fetch_add(1, Ordering::Relaxed);
+                if let Some(m) = &self.metrics {
+                    m.votes_received_total.inc();
+                }
+                self.on_vote(signer, store, out, v)
+            }
             ConsensusMsg::Evidence(ev) => {
+                self.atomic_metrics.double_sign_evidence.fetch_add(1, Ordering::Relaxed);
+                if let Some(m) = &self.metrics {
+                    m.double_sign_evidence_total.inc();
+                }
                 self.stakes.apply_evidence(&ev, self.state.height);
                 Ok(())
             }
@@ -504,6 +712,10 @@ impl<V: Verifier> Engine<V> {
         let block = store.get(&p.block_id);
         if block.is_none() {
             out.request_block(p.block_id.clone());
+            self.atomic_metrics.block_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(m) = &self.metrics {
+                m.block_requests_total.inc();
+            }
             self.state.step = Step::Prevote;
             self.step_elapsed_ms = 0;
             self.broadcast_vote(signer, out, VoteType::Prevote, None);
@@ -575,8 +787,11 @@ impl<V: Verifier> Engine<V> {
         }
         self.verify_vote(&v)?;
 
-        // Detect and broadcast evidence.
         if let Some(ev) = self.record_vote_and_detect_evidence(&v) {
+            self.atomic_metrics.double_sign_evidence.fetch_add(1, Ordering::Relaxed);
+            if let Some(m) = &self.metrics {
+                m.double_sign_evidence_total.inc();
+            }
             self.stakes.apply_evidence(&ev, self.state.height);
             out.broadcast(ConsensusMsg::Evidence(ev));
         }
@@ -615,6 +830,10 @@ impl<V: Verifier> Engine<V> {
                                 let block = store.get(&bid);
                                 if block.is_none() {
                                     out.request_block(bid.clone());
+                                    self.atomic_metrics.block_requests.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(m) = &self.metrics {
+                                        m.block_requests_total.inc();
+                                    }
                                     return Ok(());
                                 }
                                 let block = block.unwrap();
@@ -647,8 +866,16 @@ impl<V: Verifier> Engine<V> {
                                     self.cfg.gas_target,
                                 );
                                 self.base_fee_per_gas = new_base;
+
+                                self.atomic_metrics.blocks_committed.fetch_add(1, Ordering::Relaxed);
+                                if let Some(m) = &self.metrics {
+                                    m.blocks_committed_total.inc();
+                                    m.base_fee_per_gas.set(self.base_fee_per_gas as f64);
+                                }
+
                                 out.on_commit(&cert, &block, &new_state, new_base, &receipts);
                                 info!(height = self.state.height, "block committed");
+                                self.update_metrics();
                             } else {
                                 self.advance_round(signer, store, out);
                             }
@@ -720,6 +947,10 @@ impl<V: Verifier> Engine<V> {
             signature: sig,
         };
         out.broadcast(ConsensusMsg::Vote(vote));
+        self.atomic_metrics.votes_broadcast.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.votes_broadcast_total.inc();
+        }
     }
 
     /// Handle a block received in response to a `request_block`.
@@ -754,12 +985,13 @@ impl<V: Verifier> Engine<V> {
         self.state = ConsensusState::new(self.state.height + 1);
         self.step_elapsed_ms = 0;
         self.state.step = Step::Propose;
+        self.update_metrics();
         self.maybe_propose(signer, store, out, |_| Vec::new());
     }
 }
 
 // -----------------------------------------------------------------------------
-// Kernel bridge
+// Kernel bridge (unchanged functionality, with overflow safety)
 // -----------------------------------------------------------------------------
 
 /// Kernel‑visible CommitCertificate – subset of full certificate for kernel verification.
@@ -823,8 +1055,6 @@ pub fn persist_committed_block(height: u64, validator_id: u32, cert_votes: u32) 
 /// This function is called from the kernel’s syscall handler.
 /// It validates and applies a CommitCertificate provided by userspace.
 pub fn advance_tick(height: u64, round: u64, step: u8, cert_ptr: u32) -> u64 {
-    // Access the global consensus engine (singleton).
-    // In production, this would be a proper global state.
     let mut engine = crate::consensus::CONSENSUS_ENGINE.lock();
     if let Some(ref mut e) = *engine {
         if height != e.state.height {
@@ -832,7 +1062,6 @@ pub fn advance_tick(height: u64, round: u64, step: u8, cert_ptr: u32) -> u64 {
         }
         e.state.round = round as u32;
         if step != 3 {
-            // Not Precommit
             return 0;
         }
         if e.vset.total_power() == 0 {
@@ -842,7 +1071,6 @@ pub fn advance_tick(height: u64, round: u64, step: u8, cert_ptr: u32) -> u64 {
         let quorum_threshold = quorum_threshold(e.vset.total_power()) as u32;
 
         let committed = if cert_ptr == 0 {
-            // Testnet mode: trust report – require at least quorum.
             if e.vset.total_power() as u32 >= quorum_threshold {
                 debug!(peers = e.vset.total_power(), "testnet commit accepted");
                 true
@@ -851,7 +1079,6 @@ pub fn advance_tick(height: u64, round: u64, step: u8, cert_ptr: u32) -> u64 {
                 false
             }
         } else {
-            // Production mode: verify certificate.
             match load_commit_cert(cert_ptr as u64) {
                 Some(cert) if verify_commit_cert(&cert, height) => {
                     info!(
@@ -882,7 +1109,7 @@ pub fn advance_tick(height: u64, round: u64, step: u8, cert_ptr: u32) -> u64 {
                     .map(|c| c.vote_count)
                     .unwrap_or(e.vset.total_power() as u32)
             };
-            e.state.height += 1;
+            e.state.height = e.state.height.saturating_add(1);
             e.state.round = 0;
             info!(height = h, "block committed");
             persist_committed_block(h, 0, cert_votes);
@@ -896,12 +1123,25 @@ pub fn advance_tick(height: u64, round: u64, step: u8, cert_ptr: u32) -> u64 {
 // Re‑exports
 // -----------------------------------------------------------------------------
 
-// The global engine is defined elsewhere; we re‑export it here for compatibility.
-// In the original code, `CONSENSUS_ENGINE` is a global static.
-// We'll keep the existing `pub use super::CONSENSUS_ENGINE;` at the top.
-
-// We also re‑export the types needed by external callers.
 pub use super::CONSENSUS_ENGINE;
 pub use crate::consensus::messages::{ConsensusMsg, Proposal, Vote, VoteType};
 pub use crate::consensus::quorum::{quorum_threshold, VoteTally};
 pub use crate::consensus::validator_set::ValidatorSet;
+
+/// Snapshot of Prometheus metrics for external use.
+#[derive(Debug, Clone)]
+pub struct ConsensusMetricsSnapshot {
+    pub current_height: f64,
+    pub current_round: f64,
+    pub current_step: f64,
+    pub proposals_broadcast_total: u64,
+    pub proposals_received_total: u64,
+    pub votes_broadcast_total: u64,
+    pub votes_received_total: u64,
+    pub blocks_committed_total: u64,
+    pub round_advancements_total: u64,
+    pub double_sign_evidence_total: u64,
+    pub block_requests_total: u64,
+    pub base_fee_per_gas: f64,
+    pub step_elapsed_ms: f64,
+}
