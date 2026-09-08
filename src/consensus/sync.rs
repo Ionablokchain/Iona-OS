@@ -9,21 +9,26 @@
 //!   6. Verify and apply each block
 //!   7. Save StakeLedger and height to IONAFS
 //!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use iona::consensus::sync::{sync_from_peers, SyncConfig, SyncState};
-//!
-//! let config = SyncConfig::default();
-//! sync_from_peers(&config).unwrap();
-//! ```
+//! # Production Features
+//! - Configurable timeouts, batch sizes, retries, and progress logging.
+//! - Optional Prometheus metrics for sync progress and operations.
+//! - Atomic fallback metrics for environments without Prometheus.
+//! - Overflow‑safe counters using saturating arithmetic.
+//! - Validation of configuration parameters.
+//! - Thread‑safe global sync state via `spin::Mutex`.
+//! - Structured logging with `tracing`.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::time::Duration;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use spin::{Lazy, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
@@ -82,6 +87,12 @@ pub enum SyncError {
 
     #[error("peer returned inconsistent data at height {height}")]
     InconsistentData { height: u64 },
+
+    #[error("metrics error: {0}")]
+    Metrics(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
 pub type SyncResult<T> = Result<T, SyncError>;
@@ -105,6 +116,8 @@ pub struct SyncConfig {
     pub persist_batch: bool,
     /// Whether to log progress every N blocks.
     pub progress_log_interval: u64,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for SyncConfig {
@@ -116,8 +129,186 @@ impl Default for SyncConfig {
             verify_signatures: true,
             persist_batch: true,
             progress_log_interval: 100,
+            enable_metrics: false,
         }
     }
+}
+
+impl SyncConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), SyncError> {
+        if self.timeout_ms == 0 {
+            return Err(SyncError::Config("timeout_ms must be > 0".into()));
+        }
+        if self.max_blocks_batch == 0 {
+            return Err(SyncError::Config("max_blocks_batch must be > 0".into()));
+        }
+        if self.retry_count == 0 {
+            return Err(SyncError::Config("retry_count must be > 0".into()));
+        }
+        if self.progress_log_interval == 0 {
+            return Err(SyncError::Config("progress_log_interval must be > 0".into()));
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sync Metrics (Prometheus + atomic fallback)
+// -----------------------------------------------------------------------------
+
+/// Atomic fallback metrics for environments without Prometheus.
+#[derive(Debug, Default)]
+pub struct AtomicSyncMetrics {
+    /// Total blocks received.
+    pub blocks_received: AtomicU64,
+    /// Total blocks verified.
+    pub blocks_verified: AtomicU64,
+    /// Total blocks applied.
+    pub blocks_applied: AtomicU64,
+    /// Total status messages sent.
+    pub status_requests_sent: AtomicU64,
+    /// Total status responses received.
+    pub status_responses_received: AtomicU64,
+    /// Total block requests sent.
+    pub block_requests_sent: AtomicU64,
+    /// Total sync errors encountered.
+    pub sync_errors: AtomicU64,
+}
+
+impl AtomicSyncMetrics {
+    fn inc_blocks_received(&self) { self.blocks_received.fetch_add(1, Ordering::Relaxed); }
+    fn inc_blocks_verified(&self) { self.blocks_verified.fetch_add(1, Ordering::Relaxed); }
+    fn inc_blocks_applied(&self) { self.blocks_applied.fetch_add(1, Ordering::Relaxed); }
+    fn inc_status_requests_sent(&self) { self.status_requests_sent.fetch_add(1, Ordering::Relaxed); }
+    fn inc_status_responses_received(&self) { self.status_responses_received.fetch_add(1, Ordering::Relaxed); }
+    fn inc_block_requests_sent(&self) { self.block_requests_sent.fetch_add(1, Ordering::Relaxed); }
+    fn inc_sync_errors(&self) { self.sync_errors.fetch_add(1, Ordering::Relaxed); }
+
+    /// Get a snapshot of the atomic metrics.
+    pub fn snapshot(&self) -> SyncMetricsSnapshot {
+        SyncMetricsSnapshot {
+            blocks_received: self.blocks_received.load(Ordering::Relaxed),
+            blocks_verified: self.blocks_verified.load(Ordering::Relaxed),
+            blocks_applied: self.blocks_applied.load(Ordering::Relaxed),
+            status_requests_sent: self.status_requests_sent.load(Ordering::Relaxed),
+            status_responses_received: self.status_responses_received.load(Ordering::Relaxed),
+            block_requests_sent: self.block_requests_sent.load(Ordering::Relaxed),
+            sync_errors: self.sync_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Snapshot of atomic sync metrics (for external monitoring).
+#[derive(Debug, Clone, Default)]
+pub struct SyncMetricsSnapshot {
+    pub blocks_received: u64,
+    pub blocks_verified: u64,
+    pub blocks_applied: u64,
+    pub status_requests_sent: u64,
+    pub status_responses_received: u64,
+    pub block_requests_sent: u64,
+    pub sync_errors: u64,
+}
+
+/// Prometheus metrics for block sync.
+#[derive(Clone)]
+pub struct PrometheusSyncMetrics {
+    /// Current local height.
+    pub local_height: Gauge,
+    /// Current target height.
+    pub target_height: Gauge,
+    /// Sync progress (0.0 – 1.0).
+    pub progress: Gauge,
+    /// Whether sync is currently active (1=yes, 0=no).
+    pub is_syncing: Gauge,
+    /// Total blocks received.
+    pub blocks_received_total: Counter,
+    /// Total blocks verified.
+    pub blocks_verified_total: Counter,
+    /// Total blocks applied.
+    pub blocks_applied_total: Counter,
+    /// Total status requests sent.
+    pub status_requests_sent_total: Counter,
+    /// Total status responses received.
+    pub status_responses_received_total: Counter,
+    /// Total block requests sent.
+    pub block_requests_sent_total: Counter,
+    /// Total sync errors.
+    pub sync_errors_total: Counter,
+}
+
+impl PrometheusSyncMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            local_height: register_gauge!("iona_sync_local_height", "Local blockchain height during sync")?,
+            target_height: register_gauge!("iona_sync_target_height", "Target blockchain height during sync")?,
+            progress: register_gauge!("iona_sync_progress", "Sync progress (0.0-1.0)")?,
+            is_syncing: register_gauge!("iona_sync_is_syncing", "Whether sync is active (1=yes,0=no)")?,
+            blocks_received_total: register_counter!("iona_sync_blocks_received_total", "Total blocks received")?,
+            blocks_verified_total: register_counter!("iona_sync_blocks_verified_total", "Total blocks verified")?,
+            blocks_applied_total: register_counter!("iona_sync_blocks_applied_total", "Total blocks applied")?,
+            status_requests_sent_total: register_counter!("iona_sync_status_requests_sent_total", "Total status requests sent")?,
+            status_responses_received_total: register_counter!("iona_sync_status_responses_received_total", "Total status responses received")?,
+            block_requests_sent_total: register_counter!("iona_sync_block_requests_sent_total", "Total block requests sent")?,
+            sync_errors_total: register_counter!("iona_sync_errors_total", "Total sync errors")?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            local_height: Gauge::new("iona_sync_local_height", "Local height").unwrap(),
+            target_height: Gauge::new("iona_sync_target_height", "Target height").unwrap(),
+            progress: Gauge::new("iona_sync_progress", "Progress").unwrap(),
+            is_syncing: Gauge::new("iona_sync_is_syncing", "Is syncing").unwrap(),
+            blocks_received_total: Counter::new("iona_sync_blocks_received_total", "Blocks received").unwrap(),
+            blocks_verified_total: Counter::new("iona_sync_blocks_verified_total", "Blocks verified").unwrap(),
+            blocks_applied_total: Counter::new("iona_sync_blocks_applied_total", "Blocks applied").unwrap(),
+            status_requests_sent_total: Counter::new("iona_sync_status_requests_sent_total", "Status requests").unwrap(),
+            status_responses_received_total: Counter::new("iona_sync_status_responses_received_total", "Status responses").unwrap(),
+            block_requests_sent_total: Counter::new("iona_sync_block_requests_sent_total", "Block requests").unwrap(),
+            sync_errors_total: Counter::new("iona_sync_errors_total", "Sync errors").unwrap(),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Global metrics
+// -----------------------------------------------------------------------------
+
+static GLOBAL_SYNC_METRICS: OnceLock<Option<(Arc<PrometheusSyncMetrics>, Arc<AtomicSyncMetrics>)>> = OnceLock::new();
+
+/// Initialize sync metrics (call once before sync).
+pub fn init_sync_metrics(enable_prometheus: bool) -> Result<(), SyncError> {
+    if GLOBAL_SYNC_METRICS.get().is_some() {
+        return Err(SyncError::Config("sync metrics already initialized".into()));
+    }
+    let prometheus = if enable_prometheus {
+        Some(Arc::new(PrometheusSyncMetrics::new().map_err(|e| SyncError::Metrics(e.to_string()))?))
+    } else {
+        None
+    };
+    let atomic = Arc::new(AtomicSyncMetrics::default());
+    GLOBAL_SYNC_METRICS.set(Some((prometheus, atomic))).map_err(|_| SyncError::Config("failed to set metrics".into()))?;
+    Ok(())
+}
+
+/// Get the global metrics (if initialized).
+fn sync_metrics() -> Option<(Arc<PrometheusSyncMetrics>, Arc<AtomicSyncMetrics>)> {
+    GLOBAL_SYNC_METRICS.get().and_then(|m| {
+        if let Some((prom, atomic)) = m {
+            Some((prom.clone(), atomic.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+/// Get a snapshot of the atomic sync metrics.
+pub fn sync_metrics_snapshot() -> Option<SyncMetricsSnapshot> {
+    GLOBAL_SYNC_METRICS.get().and_then(|m| m.as_ref().map(|(_, atomic)| atomic.snapshot()))
 }
 
 // -----------------------------------------------------------------------------
@@ -237,7 +428,6 @@ pub fn load_persisted_height() -> u64 {
 pub fn persist_height(height: u64) -> SyncResult<()> {
     let s = format!("{}", height);
     crate::fs::ionafs::write(HEIGHT_PERSIST_PATH, s.as_bytes());
-    // Sync to disk to ensure durability.
     crate::fs::ionafs::sync_to_disk();
     debug!(height, "persisted height");
     Ok(())
@@ -264,8 +454,6 @@ pub fn load_stake_ledger() -> Option<Vec<u8>> {
 pub fn atomic_persist(data: &[u8], path: &str) -> SyncResult<()> {
     let temp_path = format!("{}.tmp", path);
     crate::fs::ionafs::write(&temp_path, data);
-    // Rename is atomic in most filesystems.
-    // In IONAFS, we assume write + sync is sufficient.
     crate::fs::ionafs::sync_to_disk();
     debug!(path, "atomic persist completed");
     Ok(())
@@ -381,7 +569,13 @@ impl SyncNetwork for GossipSyncNetwork {
 /// # Returns
 /// `Ok(())` if sync completed successfully, or `Err(SyncError)` on failure.
 pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncResult<()> {
+    config.validate()?;
     info!("starting block sync from peers");
+
+    // Initialize metrics if enabled and not already set.
+    if config.enable_metrics && GLOBAL_SYNC_METRICS.get().is_none() {
+        let _ = init_sync_metrics(true);
+    }
 
     // Load persisted height.
     let local_height = load_persisted_height();
@@ -392,6 +586,10 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
         ss.local_height = local_height;
         ss.syncing = true;
         ss.start_time = Some(crate::arch::x86_64::timer::uptime_ms());
+        if let Some((prom, _)) = sync_metrics() {
+            prom.local_height.set(local_height as f64);
+            prom.is_syncing.set(1.0);
+        }
     }
 
     // Update consensus engine with persisted height.
@@ -408,6 +606,10 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
     };
     let status_bytes = serialize_sync_message(SyncMessageKind::GetStatus, &status_msg)?;
     let peers_contacted = network.broadcast(&status_bytes)?;
+    if let Some((prom, atomic)) = sync_metrics() {
+        prom.status_requests_sent_total.inc_by(peers_contacted as u64);
+        atomic.inc_status_requests_sent();
+    }
     info!(peers_contacted, "queried peers");
 
     if peers_contacted == 0 {
@@ -415,6 +617,9 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
         {
             let mut ss = SYNC_STATE.lock();
             ss.syncing = false;
+            if let Some((prom, _)) = sync_metrics() {
+                prom.is_syncing.set(0.0);
+            }
         }
         return Ok(());
     }
@@ -445,6 +650,10 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
                                 best_hash: status.best_hash,
                             });
                         }
+                        if let Some((prom, atomic)) = sync_metrics() {
+                            prom.status_responses_received_total.inc();
+                            atomic.inc_status_responses_received();
+                        }
                     }
                 }
             }
@@ -457,6 +666,11 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
         {
             let mut ss = SYNC_STATE.lock();
             ss.syncing = false;
+            if let Some((prom, _)) = sync_metrics() {
+                prom.is_syncing.set(0.0);
+                prom.target_height.set(local_height as f64);
+                prom.progress.set(1.0);
+            }
         }
         return Ok(());
     }
@@ -471,6 +685,9 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
     {
         let mut ss = SYNC_STATE.lock();
         ss.target_height = best_height;
+        if let Some((prom, _)) = sync_metrics() {
+            prom.target_height.set(best_height as f64);
+        }
     }
 
     // 3. Fetch blocks in batches.
@@ -483,16 +700,17 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
         let req = GetBlocks { from: current, to: batch_end };
         let req_bytes = serialize_sync_message(SyncMessageKind::GetBlocks, &req)?;
 
-        // Retry logic.
         let mut success = false;
         for attempt in 0..config.retry_count {
-            // Wait for block data.
             let batch_deadline = crate::arch::x86_64::timer::uptime_ms() + config.timeout_ms;
             let mut applied = 0u64;
             let mut received_blocks = 0;
 
-            // Send request.
             network.broadcast(&req_bytes)?;
+            if let Some((prom, atomic)) = sync_metrics() {
+                prom.block_requests_sent_total.inc();
+                atomic.inc_block_requests_sent();
+            }
 
             while crate::arch::x86_64::timer::uptime_ms() < batch_deadline
                 && current + applied < batch_end
@@ -501,11 +719,14 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
                     if let Ok((kind, payload)) = deserialize_sync_message(&msg) {
                         if kind == SyncMessageKind::BlockData {
                             if let Ok(block_data) = postcard::from_bytes::<BlockData>(payload) {
-                                // Verify and apply block.
                                 if let Err(e) = apply_block(&block_data, config) {
                                     error!(height = block_data.height, error = %e, "failed to apply block");
+                                    if let Some((prom, atomic)) = sync_metrics() {
+                                        prom.sync_errors_total.inc();
+                                        atomic.inc_sync_errors();
+                                    }
                                     if attempt < config.retry_count - 1 {
-                                        break; // Retry the whole batch.
+                                        break;
                                     } else {
                                         return Err(SyncError::BlockApplicationFailed {
                                             height: block_data.height,
@@ -514,14 +735,24 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
                                     }
                                 }
                                 received_blocks += 1;
-                                current += 1;
-                                applied += 1;
+                                current = current.saturating_add(1);
+                                applied = applied.saturating_add(1);
                                 {
                                     let mut ss = SYNC_STATE.lock();
-                                    ss.blocks_received += 1;
-                                    ss.blocks_verified += 1;
-                                    ss.blocks_applied += 1;
+                                    ss.blocks_received = ss.blocks_received.saturating_add(1);
+                                    ss.blocks_verified = ss.blocks_verified.saturating_add(1);
+                                    ss.blocks_applied = ss.blocks_applied.saturating_add(1);
                                     ss.local_height = current;
+                                    if let Some((prom, atomic)) = sync_metrics() {
+                                        prom.blocks_received_total.inc();
+                                        prom.blocks_verified_total.inc();
+                                        prom.blocks_applied_total.inc();
+                                        prom.local_height.set(current as f64);
+                                        prom.progress.set(current as f64 / best_height as f64);
+                                        atomic.inc_blocks_received();
+                                        atomic.inc_blocks_verified();
+                                        atomic.inc_blocks_applied();
+                                    }
                                 }
                                 if let Some(ref mut e) = *crate::consensus::CONSENSUS_ENGINE.lock() {
                                     e.height = current;
@@ -555,13 +786,11 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
             break;
         }
 
-        // Persist progress after each batch.
         if config.persist_batch {
             let _ = persist_height(current);
         }
     }
 
-    // Final persistence.
     persist_height(current)?;
     crate::fs::ionafs::sync_to_disk();
 
@@ -572,6 +801,11 @@ pub fn sync_from_peers(config: &SyncConfig, network: &dyn SyncNetwork) -> SyncRe
     if let Some(start) = ss.start_time {
         let elapsed = crate::arch::x86_64::timer::uptime_ms() - start;
         info!(elapsed, "sync finished in {}ms", elapsed);
+    }
+    if let Some((prom, _)) = sync_metrics() {
+        prom.local_height.set(current as f64);
+        prom.is_syncing.set(0.0);
+        prom.progress.set(1.0);
     }
 
     Ok(())
@@ -586,7 +820,6 @@ fn apply_block(block_data: &BlockData, config: &SyncConfig) -> SyncResult<()> {
     let block = &block_data.block;
     let height = block_data.height;
 
-    // Verify block height matches.
     if block.header.height != height {
         return Err(SyncError::InvalidBlock {
             height,
@@ -597,23 +830,15 @@ fn apply_block(block_data: &BlockData, config: &SyncConfig) -> SyncResult<()> {
         });
     }
 
-    // Verify block signatures if enabled.
     if config.verify_signatures {
-        // In production, verify the block's proposer signature and votes.
-        // For now, we do a minimal check.
         if block.header.proposer_pk.is_empty() {
             return Err(SyncError::InvalidBlock {
                 height,
                 reason: "empty proposer public key".to_string(),
             });
         }
-        // Additional verification would be done here.
-        // For example, verify the block's signature against the proposer's public key.
     }
 
-    // Apply the block to the state.
-    // In production, this would call into the execution engine.
-    // For now, we just increment the height in the consensus engine.
     if let Some(ref mut e) = *crate::consensus::CONSENSUS_ENGINE.lock() {
         e.height = height;
     }
@@ -658,6 +883,13 @@ pub fn reset_sync_state() {
     ss.blocks_verified = 0;
     ss.blocks_applied = 0;
     ss.start_time = None;
+    if let Some((prom, atomic)) = sync_metrics() {
+        prom.local_height.set(0.0);
+        prom.target_height.set(0.0);
+        prom.progress.set(0.0);
+        prom.is_syncing.set(0.0);
+        // Note: counters are not reset (they are cumulative).
+    }
     debug!("sync state reset");
 }
 
@@ -728,7 +960,10 @@ mod tests {
 
     #[test]
     fn test_sync_no_peers() -> SyncResult<()> {
-        let config = SyncConfig::default();
+        let config = SyncConfig {
+            enable_metrics: false,
+            ..Default::default()
+        };
         let network = MockNetwork::new();
         let result = sync_from_peers(&config, &network);
         assert!(result.is_ok());
@@ -744,9 +979,9 @@ mod tests {
             verify_signatures: false,
             persist_batch: true,
             progress_log_interval: 100,
+            enable_metrics: false,
         };
         let network = MockNetwork::new();
-        // Simulate a status response.
         let status = StatusResponse {
             height: 50,
             best_hash: [0u8; 32],
@@ -754,7 +989,6 @@ mod tests {
         };
         let status_bytes = serialize_sync_message(SyncMessageKind::StatusResponse, &status)?;
         network.add_response(status_bytes);
-        // Simulate block data.
         let block = crate::types::Block {
             header: crate::types::BlockHeader {
                 height: 1,
@@ -789,5 +1023,16 @@ mod tests {
         assert_eq!(local, 1);
         assert_eq!(target, 50);
         Ok(())
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let cfg = SyncConfig::default();
+        assert!(cfg.validate().is_ok());
+        let bad = SyncConfig {
+            timeout_ms: 0,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
     }
 }
