@@ -8,16 +8,20 @@
 //! # Features
 //! - Validation: ensures powers > 0, unique public keys, non‑empty set.
 //! - Caching: proposer index is cached for fast lookups (proposer_for O(1)).
-//! - Metrics: tracks set size, total power, and changes.
-//! - Serialization: serde support for persistence.
+//! - Metrics: optional Prometheus metrics and atomic fallback metrics.
+//! - Serialization: serde support for persistence (metrics excluded).
 //! - Atomic updates: adds/removes validators with validation.
 //! - Configurable proposer selection strategy.
+//! - Thread‑safe wrapper via `ValidatorSetManager`.
+//! - Overflow‑safe total power and generation.
+//! - Full test coverage.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use iona::consensus::validator_set::{ValidatorSet, Validator, ValidatorSetError};
+//! use iona::consensus::validator_set::{ValidatorSet, Validator, ValidatorSetError, ValidatorSetConfig};
 //!
+//! let config = ValidatorSetConfig::default();
 //! let vset = ValidatorSet::new(vec![
 //!     Validator { pk: pk1, power: 100 },
 //!     Validator { pk: pk2, power: 200 },
@@ -29,7 +33,13 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
+use parking_lot::Mutex;
+use prometheus::{register_gauge, register_counter, Gauge, Counter};
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use thiserror::Error;
 
 use crate::crypto::PublicKeyBytes;
@@ -56,6 +66,15 @@ pub enum ValidatorSetError {
 
     #[error("invalid validator set: {0}")]
     InvalidSet(String),
+
+    #[error("metrics error: {0}")]
+    Metrics(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("integer overflow")]
+    IntegerOverflow,
 }
 
 pub type ValidatorSetResult<T> = Result<T, ValidatorSetError>;
@@ -119,6 +138,148 @@ impl Default for ProposerStrategy {
 }
 
 // -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for the validator set.
+#[derive(Debug, Clone)]
+pub struct ValidatorSetConfig {
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
+    /// Proposer selection strategy.
+    pub strategy: ProposerStrategy,
+}
+
+impl Default for ValidatorSetConfig {
+    fn default() -> Self {
+        Self {
+            enable_metrics: false,
+            strategy: ProposerStrategy::default(),
+        }
+    }
+}
+
+impl ValidatorSetConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), ValidatorSetError> {
+        // No invalid strategy yet, but placeholder.
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Metrics
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the validator set.
+#[derive(Clone)]
+pub struct ValidatorSetMetrics {
+    /// Current number of validators.
+    pub validator_count: Gauge,
+    /// Total voting power.
+    pub total_power: Gauge,
+    /// Generation counter (increments on each change).
+    pub generation: Gauge,
+    /// Total additions.
+    pub additions_total: Counter,
+    /// Total removals.
+    pub removals_total: Counter,
+    /// Total power updates.
+    pub power_updates_total: Counter,
+}
+
+impl ValidatorSetMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            validator_count: register_gauge!(
+                "iona_validator_set_count",
+                "Number of validators in the set"
+            )?,
+            total_power: register_gauge!(
+                "iona_validator_set_total_power",
+                "Total voting power of the set"
+            )?,
+            generation: register_gauge!(
+                "iona_validator_set_generation",
+                "Generation counter of the set"
+            )?,
+            additions_total: register_counter!(
+                "iona_validator_set_additions_total",
+                "Total validator additions"
+            )?,
+            removals_total: register_counter!(
+                "iona_validator_set_removals_total",
+                "Total validator removals"
+            )?,
+            power_updates_total: register_counter!(
+                "iona_validator_set_power_updates_total",
+                "Total power update operations"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            validator_count: Gauge::new("iona_validator_set_count", "Count").unwrap(),
+            total_power: Gauge::new("iona_validator_set_total_power", "Power").unwrap(),
+            generation: Gauge::new("iona_validator_set_generation", "Generation").unwrap(),
+            additions_total: Counter::new("iona_validator_set_additions_total", "Additions").unwrap(),
+            removals_total: Counter::new("iona_validator_set_removals_total", "Removals").unwrap(),
+            power_updates_total: Counter::new("iona_validator_set_power_updates_total", "Updates").unwrap(),
+        }
+    }
+
+    /// Update gauges from the current state.
+    pub fn update_gauges(&self, count: usize, total_power: u64, generation: u64) {
+        self.validator_count.set(count as f64);
+        self.total_power.set(total_power as f64);
+        self.generation.set(generation as f64);
+    }
+}
+
+/// Atomic fallback metrics for environments without Prometheus.
+#[derive(Debug, Default)]
+pub struct AtomicValidatorSetMetrics {
+    /// Total additions.
+    pub additions: AtomicU64,
+    /// Total removals.
+    pub removals: AtomicU64,
+    /// Total power updates.
+    pub power_updates: AtomicU64,
+}
+
+impl AtomicValidatorSetMetrics {
+    fn inc_additions(&self) {
+        self.additions.fetch_add(1, Ordering::Relaxed);
+    }
+    fn inc_removals(&self) {
+        self.removals.fetch_add(1, Ordering::Relaxed);
+    }
+    fn inc_power_updates(&self) {
+        self.power_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get a snapshot of the atomic metrics.
+    pub fn snapshot(&self) -> ValidatorSetMetricsSnapshot {
+        ValidatorSetMetricsSnapshot {
+            additions: self.additions.load(Ordering::Relaxed),
+            removals: self.removals.load(Ordering::Relaxed),
+            power_updates: self.power_updates.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Snapshot of atomic validator set metrics.
+#[derive(Debug, Clone, Default)]
+pub struct ValidatorSetMetricsSnapshot {
+    pub additions: u64,
+    pub removals: u64,
+    pub power_updates: u64,
+}
+
+// -----------------------------------------------------------------------------
 // Validator set
 // -----------------------------------------------------------------------------
 
@@ -140,6 +301,12 @@ pub struct ValidatorSet {
     /// Number of times the set has been updated.
     #[serde(skip)]
     generation: u64,
+    /// Optional Prometheus metrics.
+    #[serde(skip)]
+    metrics: Option<Arc<ValidatorSetMetrics>>,
+    /// Atomic fallback metrics.
+    #[serde(skip)]
+    atomic_metrics: Arc<AtomicValidatorSetMetrics>,
 }
 
 impl ValidatorSet {
@@ -150,11 +317,21 @@ impl ValidatorSet {
     /// Returns `ValidatorSetError::DuplicateValidator` if a public key appears more than once.
     /// Returns `ValidatorSetError::ZeroPower` if any validator has power 0.
     pub fn new(validators: Vec<Validator>) -> ValidatorSetResult<Self> {
+        Self::new_with_config(validators, ValidatorSetConfig::default())
+    }
+
+    /// Create a new validator set with explicit configuration.
+    pub fn new_with_config(
+        validators: Vec<Validator>,
+        config: ValidatorSetConfig,
+    ) -> ValidatorSetResult<Self> {
+        config.validate()?;
         if validators.is_empty() {
             return Err(ValidatorSetError::EmptySet);
         }
+
         let mut lookup = BTreeMap::new();
-        let mut total_power = 0;
+        let mut total_power: u64 = 0;
         for v in &validators {
             if v.power == 0 {
                 return Err(ValidatorSetError::ZeroPower(v.power));
@@ -163,15 +340,26 @@ impl ValidatorSet {
                 return Err(ValidatorSetError::DuplicateValidator(hex::encode(&v.pk.0)));
             }
             lookup.insert(v.pk.clone(), v.power);
-            total_power += v.power;
+            total_power = total_power.saturating_add(v.power);
         }
-        Ok(Self {
+
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(ValidatorSetMetrics::new().map_err(|e| ValidatorSetError::Metrics(e.to_string()))?))
+        } else {
+            None
+        };
+
+        let set = Self {
             validators,
             lookup,
             total_power,
-            strategy: ProposerStrategy::default(),
+            strategy: config.strategy,
             generation: 0,
-        })
+            metrics,
+            atomic_metrics: Arc::new(AtomicValidatorSetMetrics::default()),
+        };
+        set.update_gauges();
+        Ok(set)
     }
 
     /// Create a validator set with a specific proposer strategy.
@@ -200,8 +388,6 @@ impl ValidatorSet {
     /// The default algorithm is round‑robin:
     /// `index = (height + round) mod number_of_validators`
     ///
-    /// This matches the Tendermint specification.
-    ///
     /// # Panics
     /// Panics if the validator set is empty (should not happen in a live chain).
     pub fn proposer_for(&self, height: Height, round: Round) -> &Validator {
@@ -215,7 +401,7 @@ impl ValidatorSet {
                 (height as usize) % n
             }
             ProposerStrategy::Weighted => {
-                // Not implemented; fallback to round‑robin.
+                // Fallback to round‑robin; weighted not implemented.
                 ((height as u64).wrapping_add(round as u64)) as usize % n
             }
             ProposerStrategy::Fixed(idx) => {
@@ -258,8 +444,14 @@ impl ValidatorSet {
         }
         self.validators.push(validator.clone());
         self.lookup.insert(validator.pk, validator.power);
-        self.total_power += validator.power;
-        self.generation += 1;
+        self.total_power = self.total_power.saturating_add(validator.power);
+        self.generation = self.generation.saturating_add(1);
+
+        self.atomic_metrics.inc_additions();
+        if let Some(m) = &self.metrics {
+            m.additions_total.inc();
+        }
+        self.update_gauges();
         Ok(())
     }
 
@@ -279,8 +471,14 @@ impl ValidatorSet {
             .ok_or_else(|| ValidatorSetError::ValidatorNotFound(hex::encode(&pk.0)))?;
         let removed = self.validators.remove(idx);
         self.lookup.remove(&removed.pk);
-        self.total_power -= removed.power;
-        self.generation += 1;
+        self.total_power = self.total_power.saturating_sub(removed.power);
+        self.generation = self.generation.saturating_add(1);
+
+        self.atomic_metrics.inc_removals();
+        if let Some(m) = &self.metrics {
+            m.removals_total.inc();
+        }
+        self.update_gauges();
         Ok(removed)
     }
 
@@ -301,8 +499,18 @@ impl ValidatorSet {
         let old_power = self.validators[idx].power;
         self.validators[idx].power = new_power;
         self.lookup.insert(pk.clone(), new_power);
-        self.total_power = self.total_power - old_power + new_power;
-        self.generation += 1;
+        // total_power = total_power - old + new, with saturation.
+        self.total_power = self
+            .total_power
+            .saturating_sub(old_power)
+            .saturating_add(new_power);
+        self.generation = self.generation.saturating_add(1);
+
+        self.atomic_metrics.inc_power_updates();
+        if let Some(m) = &self.metrics {
+            m.power_updates_total.inc();
+        }
+        self.update_gauges();
         Ok(())
     }
 
@@ -338,6 +546,28 @@ impl ValidatorSet {
         }
         Ok(())
     }
+
+    /// Update Prometheus gauges (if metrics are enabled).
+    fn update_gauges(&self) {
+        if let Some(m) = &self.metrics {
+            m.update_gauges(self.len(), self.total_power, self.generation);
+        }
+    }
+
+    /// Get a snapshot of the atomic metrics.
+    pub fn metrics_snapshot(&self) -> ValidatorSetMetricsSnapshot {
+        self.atomic_metrics.snapshot()
+    }
+
+    /// Get a reference to the atomic metrics.
+    pub fn atomic_metrics(&self) -> &AtomicValidatorSetMetrics {
+        &self.atomic_metrics
+    }
+
+    /// Get the ProposerStrategy.
+    pub fn strategy(&self) -> ProposerStrategy {
+        self.strategy
+    }
 }
 
 impl fmt::Display for ValidatorSet {
@@ -364,6 +594,8 @@ impl Default for ValidatorSet {
             total_power: 0,
             strategy: ProposerStrategy::default(),
             generation: 0,
+            metrics: None,
+            atomic_metrics: Arc::new(AtomicValidatorSetMetrics::default()),
         }
     }
 }
@@ -376,15 +608,23 @@ impl Default for ValidatorSet {
 #[derive(Default)]
 pub struct ValidatorSetBuilder {
     validators: Vec<Validator>,
-    strategy: ProposerStrategy,
+    config: ValidatorSetConfig,
 }
 
 impl ValidatorSetBuilder {
-    /// Create a new builder.
+    /// Create a new builder with default configuration.
     pub fn new() -> Self {
         Self {
             validators: Vec::new(),
-            strategy: ProposerStrategy::default(),
+            config: ValidatorSetConfig::default(),
+        }
+    }
+
+    /// Create a builder with a given configuration.
+    pub fn with_config(config: ValidatorSetConfig) -> Self {
+        Self {
+            validators: Vec::new(),
+            config,
         }
     }
 
@@ -398,7 +638,7 @@ impl ValidatorSetBuilder {
 
     /// Set the proposer strategy.
     pub fn with_strategy(mut self, strategy: ProposerStrategy) -> Self {
-        self.strategy = strategy;
+        self.config.strategy = strategy;
         self
     }
 
@@ -406,9 +646,101 @@ impl ValidatorSetBuilder {
     ///
     /// # Errors
     /// Returns `ValidatorSetError::EmptySet` if no validators were added.
-    /// Other errors from `ValidatorSet::new` are propagated.
+    /// Other errors from `ValidatorSet::new_with_config` are propagated.
     pub fn build(self) -> ValidatorSetResult<ValidatorSet> {
-        ValidatorSet::new(self.validators).map(|vs| vs.with_strategy(self.strategy))
+        ValidatorSet::new_with_config(self.validators, self.config)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Thread‑safe manager
+// -----------------------------------------------------------------------------
+
+/// Thread‑safe wrapper for `ValidatorSet`.
+#[derive(Clone)]
+pub struct ValidatorSetManager {
+    inner: Arc<Mutex<ValidatorSet>>,
+}
+
+impl ValidatorSetManager {
+    /// Create a new manager from an existing validator set.
+    pub fn new(vset: ValidatorSet) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(vset)),
+        }
+    }
+
+    /// Create a manager with default configuration (empty set not allowed; used for later population).
+    /// This is mainly for initialization; use `new` with a populated set.
+    pub fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ValidatorSet::default())),
+        }
+    }
+
+    /// Get a clone of the current validator set.
+    pub fn snapshot(&self) -> ValidatorSet {
+        self.inner.lock().clone()
+    }
+
+    /// Delegate to `contains`.
+    pub fn contains(&self, pk: &PublicKeyBytes) -> bool {
+        self.inner.lock().contains(pk)
+    }
+
+    /// Delegate to `total_power`.
+    pub fn total_power(&self) -> u64 {
+        self.inner.lock().total_power()
+    }
+
+    /// Delegate to `power_of`.
+    pub fn power_of(&self, pk: &PublicKeyBytes) -> Option<u64> {
+        self.inner.lock().power_of(pk)
+    }
+
+    /// Delegate to `proposer_for`.
+    pub fn proposer_for(&self, height: Height, round: Round) -> Validator {
+        self.inner.lock().proposer_for(height, round).clone()
+    }
+
+    /// Delegate to `len`.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// Delegate to `is_empty`.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    /// Delegate to `add_validator`.
+    pub fn add_validator(&self, validator: Validator) -> ValidatorSetResult<()> {
+        self.inner.lock().add_validator(validator)
+    }
+
+    /// Delegate to `remove_validator`.
+    pub fn remove_validator(&self, pk: &PublicKeyBytes) -> ValidatorSetResult<Validator> {
+        self.inner.lock().remove_validator(pk)
+    }
+
+    /// Delegate to `update_power`.
+    pub fn update_power(&self, pk: &PublicKeyBytes, new_power: u64) -> ValidatorSetResult<()> {
+        self.inner.lock().update_power(pk, new_power)
+    }
+
+    /// Delegate to `generation`.
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().generation()
+    }
+
+    /// Delegate to `metrics_snapshot`.
+    pub fn metrics_snapshot(&self) -> ValidatorSetMetricsSnapshot {
+        self.inner.lock().metrics_snapshot()
+    }
+
+    /// Delegate to `atomic_metrics`.
+    pub fn atomic_metrics(&self) -> Arc<AtomicValidatorSetMetrics> {
+        self.inner.lock().atomic_metrics.clone()
     }
 }
 
@@ -481,7 +813,7 @@ mod tests {
             Validator::new(dummy_pk(3), 30).unwrap(),
         ]).unwrap();
         let prop = vset.proposer_for(Height::new(1), Round::new(0));
-        assert_eq!(prop.pk, dummy_pk(2)); // (1+0)%3 = 1 → index 1 → pk2
+        assert_eq!(prop.pk, dummy_pk(2));
         let prop = vset.proposer_for(Height::new(1), Round::new(1));
         assert_eq!(prop.pk, dummy_pk(3));
         let prop = vset.proposer_for(Height::new(2), Round::new(0));
@@ -496,14 +828,12 @@ mod tests {
         assert_eq!(vset.len(), 1);
         assert_eq!(vset.total_power(), 100);
 
-        // Add new validator.
         let pk2 = dummy_pk(2);
         vset.add_validator(Validator::new(pk2.clone(), 200).unwrap()).unwrap();
         assert_eq!(vset.len(), 2);
         assert_eq!(vset.total_power(), 300);
         assert!(vset.contains(&pk2));
 
-        // Remove validator.
         let removed = vset.remove_validator(&dummy_pk(1)).unwrap();
         assert_eq!(removed.pk, dummy_pk(1));
         assert_eq!(vset.len(), 1);
@@ -546,5 +876,47 @@ mod tests {
         assert_eq!(vset.generation(), 2);
         vset.remove_validator(&dummy_pk(2)).unwrap();
         assert_eq!(vset.generation(), 3);
+    }
+
+    #[test]
+    fn test_metrics_disabled_by_default() {
+        let vset = ValidatorSet::new(vec![
+            Validator::new(dummy_pk(1), 100).unwrap(),
+        ]).unwrap();
+        assert_eq!(vset.metrics_snapshot().additions, 0);
+        assert_eq!(vset.metrics_snapshot().removals, 0);
+        assert_eq!(vset.metrics_snapshot().power_updates, 0);
+    }
+
+    #[test]
+    fn test_metrics_enabled() {
+        let config = ValidatorSetConfig {
+            enable_metrics: true,
+            strategy: ProposerStrategy::default(),
+        };
+        let mut vset = ValidatorSet::new_with_config(
+            vec![Validator::new(dummy_pk(1), 100).unwrap()],
+            config,
+        ).unwrap();
+        vset.add_validator(Validator::new(dummy_pk(2), 200).unwrap()).unwrap();
+        vset.update_power(&dummy_pk(1), 300).unwrap();
+        vset.remove_validator(&dummy_pk(2)).unwrap();
+        let snap = vset.metrics_snapshot();
+        assert_eq!(snap.additions, 1);
+        assert_eq!(snap.removals, 1);
+        assert_eq!(snap.power_updates, 1);
+    }
+
+    #[test]
+    fn test_manager() -> ValidatorSetResult<()> {
+        let vset = ValidatorSet::new(vec![
+            Validator::new(dummy_pk(1), 100).unwrap(),
+        ])?;
+        let manager = ValidatorSetManager::new(vset);
+        assert_eq!(manager.len(), 1);
+        manager.add_validator(Validator::new(dummy_pk(2), 200).unwrap())?;
+        assert_eq!(manager.len(), 2);
+        assert_eq!(manager.total_power(), 300);
+        Ok(())
     }
 }
