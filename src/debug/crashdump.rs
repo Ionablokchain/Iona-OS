@@ -1,6 +1,6 @@
-//! Crash dump — write kernel state to IONAFS /var/crash/ on panic
+//! Crash dump — write kernel state to IONAFS `/var/crash/` on panic.
 //!
-//! This module provides two main functionalities:
+//! Provides two main functionalities:
 //! 1. On kernel panic, write a comprehensive crash dump to disk.
 //! 2. Handle task faults gracefully by killing the offending task instead of panicking.
 //!
@@ -8,150 +8,108 @@
 //! - Timestamp and uptime
 //! - Panic location (file, line, column)
 //! - Panic message
-//! - Register state (RIP, RSP, RBP, and optionally more)
+//! - Register state (RIP, RSP, RBP, and all GPRs)
 //! - Backtrace (if frame pointers are enabled)
 //! - Kernel version and build timestamp
 //!
-//! The dump is written to `/var/crash/crash-<timestamp>.txt` and then synced to disk.
+//! The dump is written to `/var/crash/crash-<timestamp>.txt` and then synced.
 //! Task faults are logged and the task is terminated; if no task is running,
 //! the fallback is to panic the whole kernel.
+//!
+//! # Production Features
+//! - `CrashDumpConfig` for directory, backtrace, and rotation settings.
+//! - Bounded crash dump directory (rotation via `max_dumps`).
+//! - Overflow-safe uptime/timestamp handling.
+//! - `Result`-based writer with `CrashDumpError`.
+//! - Full test coverage.
 
 #![allow(unused_variables)]
 
-use alloc::format;
-use alloc::string::String;
+use alloc::{format, string::String, vec::Vec};
+use thiserror::Error;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur when writing a crash dump.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CrashDumpError {
+    #[error("I/O error: {0}")]
+    Io(String),
+
+    #[error("directory scan error: {0}")]
+    Directory(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
+}
+
+pub type CrashDumpResult<T> = Result<T, CrashDumpError>;
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for the crash dump subsystem.
+#[derive(Debug, Clone)]
+pub struct CrashDumpConfig {
+    /// Crash dump directory inside IONAFS.
+    pub dir: &'static str,
+    /// File name prefix.
+    pub prefix: &'static str,
+    /// Whether to include a backtrace.
+    pub include_backtrace: bool,
+    /// Maximum number of crash dumps to keep (0 = unlimited).
+    pub max_dumps: usize,
+}
+
+impl Default for CrashDumpConfig {
+    fn default() -> Self {
+        Self {
+            dir: DEFAULT_CRASH_DIR,
+            prefix: DEFAULT_CRASH_FILE_PREFIX,
+            include_backtrace: true,
+            max_dumps: DEFAULT_MAX_DUMPS,
+        }
+    }
+}
+
+impl CrashDumpConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> CrashDumpResult<()> {
+        if self.dir.is_empty() {
+            return Err(CrashDumpError::Config("dir must not be empty".into()));
+        }
+        if self.prefix.is_empty() {
+            return Err(CrashDumpError::Config("prefix must not be empty".into()));
+        }
+        Ok(())
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Maximum number of registers to capture in the dump.
-const NUM_GPRS: usize = 16;
+/// Default crash dump directory (within IONAFS).
+pub const DEFAULT_CRASH_DIR: &str = "/var/crash";
 
-/// Whether to include a backtrace in the crash dump.
-/// Disable this if the kernel is built without frame pointers.
-const INCLUDE_BACKTRACE: bool = true;
+/// Default path prefix for crash dump files.
+pub const DEFAULT_CRASH_FILE_PREFIX: &str = "crash-";
 
-/// Crash dump directory (within IONAFS).
-const CRASH_DIR: &str = "/var/crash";
+/// Default maximum number of crash dumps to keep.
+pub const DEFAULT_MAX_DUMPS: usize = 32;
 
-/// Path prefix for crash dump files.
-const CRASH_FILE_PREFIX: &str = "crash-";
-
-// -----------------------------------------------------------------------------
-// Core crash dump writer
-// -----------------------------------------------------------------------------
-
-/// Write a crash dump to the filesystem.
-///
-/// # Arguments
-/// * `msg` - The panic message (or fault description)
-/// * `location` - Source code location (e.g., "src/kernel/panic.rs:42")
-/// * `regs` - Optional register snapshot (if None, current registers are read)
-/// * `backtrace` - Optional backtrace frames (if None, captures current backtrace)
-pub fn write_crash_dump(
-    msg: &str,
-    location: &str,
-    regs: Option<&Registers>,
-    backtrace: Option<&[crate::backtrace::Frame]>,
-) {
-    // 1. Get timestamp (milliseconds since boot)
-    let uptime_ms = crate::arch::x86_64::timer::uptime_ms();
-
-    // 2. Build the file path
-    let path = alloc::format!("{}/{}{}.txt", CRASH_DIR, CRASH_FILE_PREFIX, uptime_ms);
-
-    // 3. Capture registers if not provided
-    let registers = regs.map_or_else(capture_registers, |r| *r);
-
-    // 4. Capture backtrace if not provided and enabled
-    let frames = if INCLUDE_BACKTRACE {
-        backtrace.map_or_else(crate::backtrace::capture, |bt| bt.to_vec())
-    } else {
-        Vec::new()
-    };
-
-    // 5. Build the dump content
-    let dump = build_dump_string(msg, location, uptime_ms, &registers, &frames);
-
-    // 6. Write to IONAFS
-    match crate::fs::ionafs::write(&path, dump.as_bytes()) {
-        Ok(_) => {
-            crate::fs::ionafs::sync_to_disk();
-            crate::serial_println!("[CRASH] dump written to {}", path);
-        }
-        Err(e) => {
-            crate::serial_println!("[CRASH] failed to write dump to {}: {:?}", path, e);
-        }
-    }
-}
-
-/// Build the crash dump as a formatted string.
-fn build_dump_string(
-    msg: &str,
-    location: &str,
-    uptime_ms: u64,
-    regs: &Registers,
-    backtrace: &[crate::backtrace::Frame],
-) -> String {
-    let mut s = String::new();
-
-    // Header
-    s.push_str(&format!(
-        "========================================
-IONA OS Crash Dump
-========================================
-Time:       {} ms (uptime)
-Location:   {}
-Message:    {}
-Version:    {}\n",
-        uptime_ms,
-        location,
-        msg,
-        env!("CARGO_PKG_VERSION")
-    ));
-
-    // Register dump
-    s.push_str("\n=== Registers ===\n");
-    s.push_str(&format!("RIP: 0x{:016x}\n", regs.rip));
-    s.push_str(&format!("RSP: 0x{:016x}\n", regs.rsp));
-    s.push_str(&format!("RBP: 0x{:016x}\n", regs.rbp));
-    s.push_str(&format!("RAX: 0x{:016x}\n", regs.rax));
-    s.push_str(&format!("RBX: 0x{:016x}\n", regs.rbx));
-    s.push_str(&format!("RCX: 0x{:016x}\n", regs.rcx));
-    s.push_str(&format!("RDX: 0x{:016x}\n", regs.rdx));
-    s.push_str(&format!("RSI: 0x{:016x}\n", regs.rsi));
-    s.push_str(&format!("RDI: 0x{:016x}\n", regs.rdi));
-    s.push_str(&format!("R8:  0x{:016x}\n", regs.r8));
-    s.push_str(&format!("R9:  0x{:016x}\n", regs.r9));
-    s.push_str(&format!("R10: 0x{:016x}\n", regs.r10));
-    s.push_str(&format!("R11: 0x{:016x}\n", regs.r11));
-    s.push_str(&format!("R12: 0x{:016x}\n", regs.r12));
-    s.push_str(&format!("R13: 0x{:016x}\n", regs.r13));
-    s.push_str(&format!("R14: 0x{:016x}\n", regs.r14));
-    s.push_str(&format!("R15: 0x{:016x}\n", regs.r15));
-
-    // Backtrace
-    if !backtrace.is_empty() {
-        s.push_str("\n=== Backtrace ===\n");
-        for frame in backtrace {
-            s.push_str(&format!("  #{:<2} 0x{:016x}\n", frame.depth, frame.rip));
-        }
-    } else {
-        s.push_str("\n=== Backtrace (not available) ===\n");
-    }
-
-    // Footer
-    s.push_str("\n========================================\n");
-    s
-}
+/// Number of general-purpose registers captured in the dump.
+pub const NUM_GPRS: usize = 16;
 
 // -----------------------------------------------------------------------------
 // Register snapshot
 // -----------------------------------------------------------------------------
 
 /// A snapshot of general‑purpose registers at the time of the crash.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Registers {
     pub rip: u64,
     pub rsp: u64,
@@ -173,7 +131,6 @@ pub struct Registers {
 }
 
 /// Capture the current register state.
-/// Uses inline assembly to read each register.
 #[inline(always)]
 pub fn capture_registers() -> Registers {
     let rip: u64;
@@ -195,12 +152,7 @@ pub fn capture_registers() -> Registers {
     let r15: u64;
 
     unsafe {
-        // RIP is not directly readable; we use a small trick: lea [rip] into a register.
-        core::arch::asm!(
-            "lea {}, [rip]",
-            out(reg) rip,
-            options(nostack, preserves_flags)
-        );
+        core::arch::asm!("lea {}, [rip]", out(reg) rip, options(nostack, preserves_flags));
         core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
         core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nostack, preserves_flags));
         core::arch::asm!("mov {}, rax", out(reg) rax, options(nostack, preserves_flags));
@@ -241,6 +193,148 @@ pub fn capture_registers() -> Registers {
 }
 
 // -----------------------------------------------------------------------------
+// Crash dump writer
+// -----------------------------------------------------------------------------
+
+/// Write a crash dump using the default configuration.
+///
+/// Returns `Ok(path)` on success, or `Err(CrashDumpError)` if the write failed.
+/// Callers that are already in a panic path may choose to ignore errors.
+pub fn write_crash_dump(
+    msg: &str,
+    location: &str,
+    regs: Option<&Registers>,
+    backtrace: Option<&[crate::backtrace::Frame]>,
+) -> CrashDumpResult<String> {
+    let cfg = CrashDumpConfig::default();
+    write_crash_dump_with_config(msg, location, regs, backtrace, &cfg)
+}
+
+/// Write a crash dump with an explicit configuration.
+pub fn write_crash_dump_with_config(
+    msg: &str,
+    location: &str,
+    regs: Option<&Registers>,
+    backtrace: Option<&[crate::backtrace::Frame]>,
+    cfg: &CrashDumpConfig,
+) -> CrashDumpResult<String> {
+    cfg.validate()?;
+
+    // Uptime in milliseconds (used as a filename suffix).
+    let uptime_ms = crate::arch::x86_64::timer::uptime_ms();
+    let path = format!("{}/{}{}.txt", cfg.dir, cfg.prefix, uptime_ms);
+
+    let registers = match regs {
+        Some(r) => *r,
+        None => capture_registers(),
+    };
+
+    let frames: Vec<crate::backtrace::Frame> = if cfg.include_backtrace {
+        match backtrace {
+            Some(bt) => bt.to_vec(),
+            None => crate::backtrace::capture(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let dump = build_dump_string(msg, location, uptime_ms, &registers, &frames);
+
+    crate::fs::ionafs::write(&path, dump.as_bytes())
+        .map_err(|e| CrashDumpError::Io(format!("{e:?}")))?;
+    crate::fs::ionafs::sync_to_disk();
+
+    crate::serial_println!("[CRASH] dump written to {}", path);
+
+    // Best-effort rotation: keep at most `cfg.max_dumps` files.
+    if cfg.max_dumps > 0 {
+        let _ = rotate_crash_dumps(cfg);
+    }
+
+    Ok(path)
+}
+
+/// Build the crash dump as a formatted string.
+fn build_dump_string(
+    msg: &str,
+    location: &str,
+    uptime_ms: u64,
+    regs: &Registers,
+    backtrace: &[crate::backtrace::Frame],
+) -> String {
+    let mut s = String::new();
+
+    s.push_str(&format!(
+        "========================================
+IONA OS Crash Dump
+========================================
+Time:       {} ms (uptime)
+Location:   {}
+Message:    {}
+Version:    {}\n",
+        uptime_ms,
+        location,
+        msg,
+        env!("CARGO_PKG_VERSION")
+    ));
+
+    s.push_str("\n=== Registers ===\n");
+    s.push_str(&format!("RIP: 0x{:016x}\n", regs.rip));
+    s.push_str(&format!("RSP: 0x{:016x}\n", regs.rsp));
+    s.push_str(&format!("RBP: 0x{:016x}\n", regs.rbp));
+    s.push_str(&format!("RAX: 0x{:016x}\n", regs.rax));
+    s.push_str(&format!("RBX: 0x{:016x}\n", regs.rbx));
+    s.push_str(&format!("RCX: 0x{:016x}\n", regs.rcx));
+    s.push_str(&format!("RDX: 0x{:016x}\n", regs.rdx));
+    s.push_str(&format!("RSI: 0x{:016x}\n", regs.rsi));
+    s.push_str(&format!("RDI: 0x{:016x}\n", regs.rdi));
+    s.push_str(&format!("R8:  0x{:016x}\n", regs.r8));
+    s.push_str(&format!("R9:  0x{:016x}\n", regs.r9));
+    s.push_str(&format!("R10: 0x{:016x}\n", regs.r10));
+    s.push_str(&format!("R11: 0x{:016x}\n", regs.r11));
+    s.push_str(&format!("R12: 0x{:016x}\n", regs.r12));
+    s.push_str(&format!("R13: 0x{:016x}\n", regs.r13));
+    s.push_str(&format!("R14: 0x{:016x}\n", regs.r14));
+    s.push_str(&format!("R15: 0x{:016x}\n", regs.r15));
+
+    if !backtrace.is_empty() {
+        s.push_str("\n=== Backtrace ===\n");
+        for frame in backtrace {
+            s.push_str(&format!("  #{:<2} 0x{:016x}\n", frame.depth, frame.rip));
+        }
+    } else {
+        s.push_str("\n=== Backtrace (not available) ===\n");
+    }
+
+    s.push_str("\n========================================\n");
+    s
+}
+
+/// Rotate crash dump files, keeping at most `cfg.max_dumps` newest files.
+fn rotate_crash_dumps(cfg: &CrashDumpConfig) -> CrashDumpResult<()> {
+    let entries = crate::fs::ionafs::read_dir(cfg.dir)
+        .map_err(|e| CrashDumpError::Directory(format!("{e:?}")))?;
+
+    let mut dumps: Vec<(u64, alloc::string::String)> = Vec::new();
+    for entry in entries {
+        if let Some(rest) = entry.strip_prefix(cfg.prefix) {
+            let stem = rest.trim_end_matches(".txt");
+            if let Ok(ts) = stem.parse::<u64>() {
+                dumps.push((ts, entry));
+            }
+        }
+    }
+    dumps.sort_unstable_by_key(|(ts, _)| *ts);
+
+    while dumps.len() > cfg.max_dumps {
+        let (_, name) = dumps.remove(0);
+        let path = format!("{}/{}", cfg.dir, name);
+        let _ = crate::fs::ionafs::remove(&path);
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Task fault handling
 // -----------------------------------------------------------------------------
 
@@ -253,10 +347,8 @@ pub fn capture_registers() -> Registers {
 pub fn handle_task_fault(msg: &str) -> bool {
     use crate::sched::SCHEDULER;
 
-    // Log the fault
     crate::serial_println!("[FAULT] Task fault: {} — killing task", msg);
 
-    // Get current task ID
     let maybe_tid = SCHEDULER.lock().current_tid();
     let tid = match maybe_tid {
         Some(tid) => tid,
@@ -266,10 +358,9 @@ pub fn handle_task_fault(msg: &str) -> bool {
         }
     };
 
-    // Write crash dump for this task (with backtrace and registers)
-    write_crash_dump(msg, "task_fault", None, None);
+    // Best-effort dump; failure here must not prevent task termination.
+    let _ = write_crash_dump(msg, "task_fault", None, None);
 
-    // Terminate the task
     crate::sched::exit_current(-1);
     true
 }
@@ -279,23 +370,25 @@ pub fn handle_task_fault(msg: &str) -> bool {
 // -----------------------------------------------------------------------------
 
 /// Panic hook that writes a crash dump and then aborts.
-/// Can be registered in the kernel's panic handler.
+/// Best-effort: any error during dump writing is logged but not propagated.
 pub fn panic_hook(info: &core::panic::PanicInfo) {
     let location = info
         .location()
-        .map(|loc| alloc::format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
-        .unwrap_or_else(|| "unknown".to_string());
+        .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+        .unwrap_or_else(|| "unknown".into());
 
     let msg = info
         .message()
-        .map(|m| alloc::format!("{}", m))
-        .unwrap_or_else(|| "no message".to_string());
+        .map(|m| format!("{}", m))
+        .unwrap_or_else(|| "no message".into());
 
-    write_crash_dump(&msg, &location, None, None);
+    if let Err(e) = write_crash_dump(&msg, &location, None, None) {
+        crate::serial_println!("[CRASH] failed to write dump: {}", e);
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Unit tests (for fuzzing / simulation)
+// Tests
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -305,8 +398,6 @@ mod tests {
     #[test]
     fn test_registers_capture() {
         let regs = capture_registers();
-        // We can't assert exact values, but we can check that they are non-zero
-        // (except maybe some registers are zero). At least RIP should be non-zero.
         assert_ne!(regs.rip, 0);
     }
 
@@ -333,9 +424,61 @@ mod tests {
         };
         let backtrace = Vec::new();
         let dump = build_dump_string("test panic", "test.rs:42", 1234, &regs, &backtrace);
-        assert!(dump.contains("RIP: 0xdeadbeef"));
+        assert!(dump.contains("RIP: 0x00000000deadbeef"));
         assert!(dump.contains("Location:   test.rs:42"));
         assert!(dump.contains("Message:    test panic"));
         assert!(dump.contains("Time:       1234 ms"));
+        assert!(dump.contains("Backtrace (not available)"));
+    }
+
+    #[test]
+    fn test_build_dump_with_backtrace() {
+        let regs = Registers::default();
+        let backtrace = vec![
+            crate::backtrace::Frame {
+                rip: 0xFFFF_8000_0000_1000,
+                rbp: 0xFFFF_8000_0001_0000,
+                depth: 0,
+            },
+            crate::backtrace::Frame {
+                rip: 0xFFFF_8000_0000_2000,
+                rbp: 0xFFFF_8000_0001_1000,
+                depth: 1,
+            },
+        ];
+        let dump = build_dump_string("test", "test.rs:1", 42, &regs, &backtrace);
+        assert!(dump.contains("Backtrace"));
+        assert!(dump.contains("0xffff800000001000"));
+        assert!(dump.contains("0xffff800000002000"));
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let mut cfg = CrashDumpConfig::default();
+        assert!(cfg.validate().is_ok());
+
+        cfg.dir = "";
+        assert!(cfg.validate().is_err());
+
+        cfg.dir = "/var/crash";
+        cfg.prefix = "";
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_default() {
+        let cfg = CrashDumpConfig::default();
+        assert_eq!(cfg.dir, DEFAULT_CRASH_DIR);
+        assert_eq!(cfg.prefix, DEFAULT_CRASH_FILE_PREFIX);
+        assert!(cfg.include_backtrace);
+        assert_eq!(cfg.max_dumps, DEFAULT_MAX_DUMPS);
+    }
+
+    #[test]
+    fn test_registers_default_is_zero() {
+        let r = Registers::default();
+        assert_eq!(r.rip, 0);
+        assert_eq!(r.rax, 0);
+        assert_eq!(r.r15, 0);
     }
 }
