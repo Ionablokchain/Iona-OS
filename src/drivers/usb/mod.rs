@@ -1,428 +1,1042 @@
-//! XHCI USB 3.0 Host Controller Driver — Full Implementation
+//! XHCI USB 3.0 Host Controller Driver.
 //!
-//! Subsisteme implementate:
-//!   - Controller init (reset + enable)
-//!   - Event Ring Segment Table (ERST)
-//!   - Command Ring (pentru configurare device-uri)
-//!   - Port detection + reset (USB 2.0 și 3.0)
-//!   - Device enumeration (Get Descriptor)
-//!   - HID keyboard endpoint interrupt transfer
-//!   - Scancode → ASCII (HID Usage Tables)
+//! # What is implemented
 //!
-//! Spec: xHCI 1.2 Specification (Intel)
+//! * Controller reset and bring-up per xHCI 1.2 §4.2.
+//! * Command Ring (producer ring, wraps via Link TRB).
+//! * Event Ring (linear ring, wraps via cycle bit; no Link TRB).
+//! * Event Ring Segment Table (ERST) and DCBAAP, both persistent,
+//!   64-byte aligned, zeroed at init.
+//! * Interrupter 0 enable (IMAN.IE), ERDP management.
+//! * Port power-on, connect detection, port reset (PR / WPR), PED check.
+//! * HID Usage → ASCII mapping including Shift and full US punctuation.
+//! * Small HID boot-keyboard state machine (modifiers, CapsLock, key
+//!   rollover, new-press detection).
+//!
+//! # What is **not** implemented (honest list)
+//!
+//! * **Device enumeration.** `Address Device`, `Get Descriptor`,
+//!   `Set Configuration`, `Configure Endpoint`, and HID Report Descriptor
+//!   parsing are not implemented. Ports detect as enabled, but no slot,
+//!   device context, or endpoint ring is created. No HID interrupt
+//!   transfer is submitted.
+//! * **Control transfers.** Setup → Data → Status staging is not
+//!   implemented.
+//! * **MSI-X.** Interrupts arrive through the legacy INTx path.
+//! * **USB 3.0 link training.** WPR is issued, but link-state handling
+//!   (U0/U1/U2/U3) beyond PED is not tracked.
+//! * **Hub support / tier topology.** Only root ports are probed.
+//!
+//! Because enumeration is unimplemented, no USB keyboard or mouse will
+//! actually work through this driver today. The rest of the module is a
+//! correct foundation that a future enumeration implementation can build
+//! on without re-addressing any of the bring-up code.
+//!
+//! # Preconditions
+//!
+//! * Physical memory is identity-mapped at [`PHYS_OFFSET`].
+//! * The global allocator returns physically-contiguous memory in that
+//!   range (required for DMA rings).
+//! * PCI bus mastering is enabled by the caller or by
+//!   [`crate::pci::enable_device`].
 
 use alloc::vec::Vec;
+
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use spin::Mutex;
+
 use crate::pci::PciDevice;
 
-// ── XHCI Register Offsets ─────────────────────────────────────────────────────
-const CAP_CAPLENGTH:  u64 = 0x00;  // Capability Register Length (u8)
-const CAP_HCSPARAMS1: u64 = 0x04;  // Structural Parameters 1
-const CAP_HCSPARAMS2: u64 = 0x08;  // Structural Parameters 2
-const CAP_DBOFF:      u64 = 0x14;  // Doorbell Array Offset
-const CAP_RTSOFF:     u64 = 0x18;  // Runtime Register Space Offset
+// ---------------------------------------------------------------------------
+// Register offsets
+// ---------------------------------------------------------------------------
 
-// Operational registers (base + CAPLENGTH)
+const CAP_CAPLENGTH:  u64 = 0x00;
+const CAP_HCSPARAMS1: u64 = 0x04;
+const CAP_HCSPARAMS2: u64 = 0x08;
+const CAP_DBOFF:      u64 = 0x14;
+const CAP_RTSOFF:     u64 = 0x18;
+
 const OP_USBCMD:   u64 = 0x00;
 const OP_USBSTS:   u64 = 0x04;
 const OP_PAGESIZE: u64 = 0x08;
-const OP_DNCTRL:   u64 = 0x14;
-const OP_CRCR:     u64 = 0x18;  // Command Ring Control Register
-const OP_DCBAAP:   u64 = 0x30;  // Device Context Base Address Array Pointer
+const OP_CRCR:     u64 = 0x18;
+const OP_DCBAAP:   u64 = 0x30;
 const OP_CONFIG:   u64 = 0x38;
 
-// USBCMD bits
-const CMD_RUN:    u32 = 1 << 0;
-const CMD_RESET:  u32 = 1 << 1;
-const CMD_INTE:   u32 = 1 << 2;
+const USBCMD_RUN:   u32 = 1 << 0;
+const USBCMD_HCRST: u32 = 1 << 1;
+const USBCMD_INTE:  u32 = 1 << 2;
 
-// USBSTS bits
-const STS_HCH:    u32 = 1 << 0;   // HC Halted
-const STS_CNR:    u32 = 1 << 11;  // Controller Not Ready
+const USBSTS_HCH: u32 = 1 << 0;
+const USBSTS_CNR: u32 = 1 << 11;
 
-// Transfer Request Block (TRB) — 16 bytes
+// Interrupter 0 offsets relative to RT_BASE + 0x20.
+const IR_IMAN:   u64 = 0x00;
+const IR_ERSTSZ: u64 = 0x08;
+const IR_ERSTBA: u64 = 0x10;
+const IR_ERDP:   u64 = 0x18;
+
+const IMAN_IE: u32 = 1 << 1;
+
+// ---------------------------------------------------------------------------
+// PORTSC bits (xHCI 1.2 §5.4.8)
+// ---------------------------------------------------------------------------
+
+const PORTSC_CCS:  u32 = 1 << 0;
+const PORTSC_PED:  u32 = 1 << 1;
+const PORTSC_PR:   u32 = 1 << 4;
+const PORTSC_PLS_SHIFT: u32 = 5;
+const PORTSC_PP:   u32 = 1 << 9;
+const PORTSC_CSC:  u32 = 1 << 17;
+const PORTSC_WRC:  u32 = 1 << 19;
+const PORTSC_PRC:  u32 = 1 << 21;
+const PORTSC_PLC:  u32 = 1 << 22;
+const PORTSC_WPR:  u32 = 1 << 31;
+
+/// All W1C change bits we care to clear after reset.
+const PORTSC_CHANGE_BITS: u32 =
+    PORTSC_CSC | PORTSC_WRC | PORTSC_PRC | PORTSC_PLC;
+
+/// Port register spacing (xHCI 1.2 §5.4.8).
+const PORT_REG_STRIDE: u64 = 0x10;
+const PORT_REG_BASE_OFF: u64 = 0x400;
+
+// ---------------------------------------------------------------------------
+// Ring geometry
+// ---------------------------------------------------------------------------
+
+/// Command ring depth in TRBs (one slot is the Link TRB).
+const COMMAND_RING_SIZE: usize = 64;
+
+/// Event ring depth in TRBs (linear, no link).
+const EVENT_RING_SIZE: usize = 64;
+
+const TRB_SIZE: usize = 16;
+
+/// All xHCI DMA structures require 64-byte alignment.
+const RING_ALIGN: usize = 64;
+
+// ---------------------------------------------------------------------------
+// TRB types (xHCI 1.2 Table 6-91)
+// ---------------------------------------------------------------------------
+
+const TRB_TYPE_LINK:              u32 = 6;
+const TRB_TYPE_ENABLE_SLOT:       u32 = 9;
+const TRB_TYPE_TRANSFER_EVENT:    u32 = 32;
+const TRB_TYPE_CMD_COMPLETION:    u32 = 33;
+const TRB_TYPE_PORT_STATUS_CHG:   u32 = 34;
+const TRB_TYPE_HOST_CONTROLLER:   u32 = 37;
+
+const COMPLETION_SUCCESS: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// Timeouts (milliseconds)
+// ---------------------------------------------------------------------------
+
+const HC_HALT_TIMEOUT_MS: u64 = 100;
+const HC_RESET_TIMEOUT_MS: u64 = 500;
+const CNR_TIMEOUT_MS:      u64 = 500;
+const PORT_RESET_TIMEOUT_MS: u64 = 500;
+
+// ---------------------------------------------------------------------------
+// Physical memory offset
+// ---------------------------------------------------------------------------
+
+const PHYS_OFFSET: usize = 0xFFFF_8000_0000_0000;
+
+// ---------------------------------------------------------------------------
+// DMA buffer
+// ---------------------------------------------------------------------------
+
+/// Persistent, aligned DMA allocation. The owning `Vec<u8>` is kept
+/// alive for the whole lifetime of the `Dma`, so the virtual pointer
+/// (and therefore the physical address) is stable across moves of the
+/// containing struct.
+struct Dma {
+    raw:    Vec<u8>,
+    offset: usize,
+    len:    usize,
+}
+
+impl Dma {
+    fn new(len: usize, align: usize) -> Option<Self> {
+        if len == 0 || !align.is_power_of_two() {
+            return None;
+        }
+        let raw = alloc::vec![0u8; len.checked_add(align)?];
+        let base = raw.as_ptr() as usize;
+        let aligned = (base + align - 1) & !(align - 1);
+        Some(Self { raw, offset: aligned - base, len })
+    }
+
+    fn virt(&self) -> *mut u8 {
+        unsafe { self.raw.as_ptr().add(self.offset) as *mut u8 }
+    }
+
+    fn phys(&self) -> Option<u64> {
+        let addr = self.virt() as usize;
+        if addr < PHYS_OFFSET { return None; }
+        Some((addr - PHYS_OFFSET) as u64)
+    }
+
+    fn len(&self) -> usize { self.len }
+}
+
+// ---------------------------------------------------------------------------
+// TRB
+// ---------------------------------------------------------------------------
+
 #[repr(C, align(16))]
-#[derive(Clone, Copy, Default)]
-pub struct Trb {
-    pub param:   u64,
-    pub status:  u32,
-    pub control: u32,
+#[derive(Clone, Copy)]
+struct Trb {
+    param:   u64,
+    status:  u32,
+    control: u32,
 }
 
 impl Trb {
-    fn link(ring_phys: u64, toggle: bool) -> Self {
-        Trb {
-            param:   ring_phys,
-            status:  0,
-            control: (6 << 10) | if toggle { 1 << 1 } else { 0 } | 1, // Link TRB, type=6
+    const ZERO: Self = Self { param: 0, status: 0, control: 0 };
+
+    #[inline]
+    fn trb_type(&self) -> u32 { (self.control >> 10) & 0x3F }
+
+    #[inline]
+    fn cycle(&self) -> u8 { (self.control & 1) as u8 }
+
+    #[inline]
+    fn completion_code(&self) -> u8 { (self.status >> 24) as u8 }
+
+    fn link(ring_phys: u64, cycle: u8) -> Self {
+        Self {
+            param: ring_phys,
+            status: 0,
+            // Type=6, TC=1 (toggle cycle on wrap), cycle bit in bit 0.
+            control: (TRB_TYPE_LINK << 10) | (1 << 1) | (cycle as u32),
         }
     }
 
     fn enable_slot() -> Self {
-        Trb { param: 0, status: 0, control: (9 << 10) | 1 } // Enable Slot command
+        Self { param: 0, status: 0, control: (TRB_TYPE_ENABLE_SLOT << 10) }
     }
 }
 
-const RING_SIZE: usize = 64; // TRBs per ring
+const _: () = {
+    assert!(core::mem::size_of::<Trb>() == TRB_SIZE);
+    assert!(core::mem::align_of::<Trb>() == 16);
+};
 
-pub struct TrbRing {
-    pub trbs:      Vec<Trb>,
-    pub enqueue:   usize,
-    pub cycle:     u8,        // Producer cycle bit
+// ---------------------------------------------------------------------------
+// Command ring (producer ring, wraps via Link TRB)
+// ---------------------------------------------------------------------------
+
+struct CommandRing {
+    mem:     Dma,
+    enqueue: u32,
+    cycle:   u8,
 }
 
-impl TrbRing {
-    fn new() -> Self {
-        let mut trbs = alloc::vec![Trb::default(); RING_SIZE];
-        // Last entry is a Link TRB pointing back to start
-        let phys = 0u64; // filled in after allocation
-        trbs[RING_SIZE - 1] = Trb::link(phys, true);
-        Self { trbs, enqueue: 0, cycle: 1 }
+impl CommandRing {
+    fn new() -> Option<Self> {
+        let mem = Dma::new(COMMAND_RING_SIZE * TRB_SIZE, RING_ALIGN)?;
+        let ring_phys = mem.phys()?;
+        let mut ring = Self { mem, enqueue: 0, cycle: 1 };
+        // Pre-place the link TRB with the initial cycle bit.
+        ring.write_trb(COMMAND_RING_SIZE - 1, Trb::link(ring_phys, 1));
+        Some(ring)
     }
 
-    fn phys_addr(&self) -> u64 {
-        let phys_off = 0xFFFF_8000_0000_0000u64;
-        self.trbs.as_ptr() as u64 - phys_off
+    fn phys(&self) -> u64 { self.mem.phys().unwrap_or(0) }
+
+    fn write_trb(&mut self, idx: usize, trb: Trb) {
+        debug_assert!(idx < COMMAND_RING_SIZE);
+        unsafe {
+            let p = self.mem.virt().add(idx * TRB_SIZE) as *mut Trb;
+            p.write_volatile(trb);
+        }
     }
 
     fn push(&mut self, mut trb: Trb) {
+        // Stamp the producer cycle bit on the TRB being published.
         trb.control = (trb.control & !1) | self.cycle as u32;
-        self.trbs[self.enqueue] = trb;
+        self.write_trb(self.enqueue as usize, trb);
+        compiler_fence(Ordering::SeqCst);
+
         self.enqueue += 1;
-        if self.enqueue >= RING_SIZE - 1 {
-            // Update link TRB and wrap
-            let phys = self.phys_addr();
-            self.trbs[RING_SIZE - 1] = Trb::link(phys, true);
-            self.trbs[RING_SIZE - 1].control |= self.cycle as u32;
+        if self.enqueue as usize >= COMMAND_RING_SIZE - 1 {
+            // Update the link TRB with the current cycle before toggling
+            // so hardware sees a matching cycle at the end of this
+            // generation.
+            let ring_phys = self.mem.phys().unwrap_or(0);
+            self.write_trb(COMMAND_RING_SIZE - 1, Trb::link(ring_phys, self.cycle));
+            compiler_fence(Ordering::SeqCst);
             self.enqueue = 0;
             self.cycle ^= 1;
         }
     }
 }
 
-// Event Ring Segment Table Entry
-#[repr(C, align(64))]
-struct ErstEntry {
-    base:    u64,
-    size:    u32,
-    _rsvd:   u32,
+// ---------------------------------------------------------------------------
+// Event ring (linear ring, wraps via cycle bit)
+// ---------------------------------------------------------------------------
+
+struct EventRing {
+    mem:      Dma,
+    dequeue:  u32,
+    cycle:    u8,
+    size:     u32,
 }
 
+impl EventRing {
+    fn new() -> Option<Self> {
+        let mem = Dma::new(EVENT_RING_SIZE * TRB_SIZE, RING_ALIGN)?;
+        Some(Self { mem, dequeue: 0, cycle: 1, size: EVENT_RING_SIZE as u32 })
+    }
+
+    fn phys(&self) -> Option<u64> { self.mem.phys() }
+
+    fn size(&self) -> u32 { self.size }
+
+    fn pop(&mut self) -> Option<Trb> {
+        let idx = self.dequeue as usize;
+        let trb = unsafe {
+            (self.mem.virt().add(idx * TRB_SIZE) as *const Trb).read_volatile()
+        };
+        compiler_fence(Ordering::SeqCst);
+        if trb.cycle() != self.cycle {
+            return None;
+        }
+        self.dequeue += 1;
+        if self.dequeue >= self.size {
+            self.dequeue = 0;
+            self.cycle ^= 1;
+        }
+        Some(trb)
+    }
+
+    /// Publish the current dequeue index to ERDP, clearing EHB.
+    fn advance_erdp(&self, rt_base: u64) {
+        let Some(phys) = self.mem.phys() else { return; };
+        let val = phys + (self.dequeue as u64 * TRB_SIZE as u64);
+        let erdp = rt_base + 0x20 + IR_ERDP;
+        unsafe { ((erdp) as *mut u64).write_volatile(val); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ERST entry
+// ---------------------------------------------------------------------------
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct ErstEntry {
+    base:  u64,
+    size:  u32,
+    _rsvd: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Controller
+// ---------------------------------------------------------------------------
+
 pub struct XhciController {
-    base:       u64,   // MMIO base (phys + offset)
-    op_base:    u64,   // Operational registers base
-    db_base:    u64,   // Doorbell array base
-    rt_base:    u64,   // Runtime registers base
-    cmd_ring:   TrbRing,
-    evt_ring:   TrbRing,
-    evt_dequeue: usize,
-    evt_cycle:  u8,
-    pub max_slots: u32,
-    pub max_ports: u32,
-    pub usb_keyboards: Vec<u8>,  // port indices with keyboards
+    base:    u64,
+    op_base: u64,
+    db_base: u64,
+    rt_base: u64,
+
+    max_slots: u32,
+    max_ports: u32,
+
+    cmd_ring: CommandRing,
+    evt_ring: EventRing,
+
+    /// DCBAAP target; must outlive the controller.
+    _dcba: Dma,
+    /// ERST target; must outlive the controller.
+    _erst: Dma,
+
+    /// Ports that a future enumeration layer should probe for HID
+    /// keyboards. Empty until enumeration is implemented.
+    pub candidate_keyboard_ports: Vec<u8>,
 }
 
 impl XhciController {
-    fn read32(&self, off: u64) -> u32 {
-        unsafe { ((self.base + off) as *const u32).read_volatile() }
+    // ----- MMIO helpers --------------------------------------------------
+
+    #[inline]
+    unsafe fn rd32(&self, off: u64) -> u32 {
+        ((self.base + off) as *const u32).read_volatile()
     }
-    fn write32(&self, off: u64, v: u32) {
-        unsafe { ((self.base + off) as *mut u32).write_volatile(v); }
+    #[inline]
+    unsafe fn wr32(&self, off: u64, v: u32) {
+        ((self.base + off) as *mut u32).write_volatile(v);
     }
-    fn op_read32(&self, off: u64) -> u32 {
-        unsafe { ((self.op_base + off) as *const u32).read_volatile() }
+    #[inline]
+    unsafe fn rd64(&self, off: u64) -> u64 {
+        ((self.base + off) as *const u64).read_volatile()
     }
-    fn op_write32(&self, off: u64, v: u32) {
-        unsafe { ((self.op_base + off) as *mut u32).write_volatile(v); }
-    }
-    fn op_write64(&self, off: u64, v: u64) {
-        unsafe { ((self.op_base + off) as *mut u64).write_volatile(v); }
+    #[inline]
+    unsafe fn wr64(&self, off: u64, v: u64) {
+        ((self.base + off) as *mut u64).write_volatile(v);
     }
 
-    /// Full XHCI initialization sequence
+    #[inline]
+    unsafe fn op_rd32(&self, off: u64) -> u32 {
+        ((self.op_base + off) as *const u32).read_volatile()
+    }
+    #[inline]
+    unsafe fn op_wr32(&self, off: u64, v: u32) {
+        ((self.op_base + off) as *mut u32).write_volatile(v);
+    }
+    #[inline]
+    unsafe fn op_wr64(&self, off: u64, v: u64) {
+        ((self.op_base + off) as *mut u64).write_volatile(v);
+    }
+
+    #[inline]
+    unsafe fn rt_rd32(&self, off: u64) -> u32 {
+        ((self.rt_base + off) as *const u32).read_volatile()
+    }
+    #[inline]
+    unsafe fn rt_wr32(&self, off: u64, v: u32) {
+        ((self.rt_base + off) as *mut u32).write_volatile(v);
+    }
+    #[inline]
+    unsafe fn rt_wr64(&self, off: u64, v: u64) {
+        ((self.rt_base + off) as *mut u64).write_volatile(v);
+    }
+
+    // ----- Init ----------------------------------------------------------
+
+    /// Full controller bring-up. Returns `true` on success.
+    ///
+    /// Per xHCI 1.2 §4.2: wait CNR=0 → clear RUN → wait HCH=1 → HCRST
+    /// → wait HCRST=0 / CNR=0 / HCH=1 → program DCBAAP, CRCR, CONFIG
+    /// → enable interrupter → set RUN.
     pub fn init(&mut self) -> bool {
-        // 1. Stop HC
-        let cmd = self.op_read32(OP_USBCMD);
-        self.op_write32(OP_USBCMD, cmd & !CMD_RUN);
-
-        // Wait for HC to halt
-        let dl = crate::arch::x86_64::timer::uptime_ms() + 100;
-        while self.op_read32(OP_USBSTS) & STS_HCH == 0 {
-            if crate::arch::x86_64::timer::uptime_ms() > dl { return false; }
-        }
-
-        // 2. Reset HC
-        self.op_write32(OP_USBCMD, CMD_RESET);
-        let dl = crate::arch::x86_64::timer::uptime_ms() + 500;
-        while self.op_read32(OP_USBCMD) & CMD_RESET != 0 {
-            if crate::arch::x86_64::timer::uptime_ms() > dl { return false; }
-        }
-
-        // Wait CNR to clear
-        let dl = crate::arch::x86_64::timer::uptime_ms() + 500;
-        while self.op_read32(OP_USBSTS) & STS_CNR != 0 {
-            if crate::arch::x86_64::timer::uptime_ms() > dl { return false; }
-        }
-
-        // 3. Configure DCBAAP (device context base address array)
-        // Simplified: allocate zeroed array for max_slots+1 entries
-        let dcba_size = ((self.max_slots + 1) as usize) * 8;
-        let dcba = alloc::vec![0u64; dcba_size / 8 + 1];
-        let dcba_phys = dcba.as_ptr() as u64 - 0xFFFF_8000_0000_0000;
-        self.op_write64(OP_DCBAAP, dcba_phys);
-
-        // 4. Setup Command Ring
-        let cmd_phys = self.cmd_ring.phys_addr();
-        // Update link TRB in cmd_ring
-        self.cmd_ring.trbs[RING_SIZE - 1] = Trb::link(cmd_phys, true);
-        self.cmd_ring.trbs[RING_SIZE - 1].control |= self.cmd_ring.cycle as u32;
-        self.op_write64(OP_CRCR, cmd_phys | 1); // bit 0 = Consumer Cycle State
-
-        // 5. Setup Event Ring
-        let evt_phys = self.evt_ring.phys_addr();
-        // Write ERST (Event Ring Segment Table)
-        let erst = ErstEntry {
-            base: evt_phys,
-            size: RING_SIZE as u32,
-            _rsvd: 0,
-        };
-        let erst_phys = &erst as *const ErstEntry as u64 - 0xFFFF_8000_0000_0000;
-
-        // Interrupter 0 registers at RT_BASE + 0x20
-        let ir0 = self.rt_base + 0x20;
         unsafe {
-            // ERSTSZ = 1 (one segment)
-            ((ir0 + 0x08) as *mut u32).write_volatile(1);
-            // ERDP (Event Ring Dequeue Pointer)
-            ((ir0 + 0x18) as *mut u64).write_volatile(evt_phys);
-            // ERSTBA (Event Ring Segment Table Base Address)
-            ((ir0 + 0x10) as *mut u64).write_volatile(erst_phys);
+            // 1. Wait for CNR = 0.
+            if !wait_bit(self, OP_USBSTS, USBSTS_CNR, false, CNR_TIMEOUT_MS) {
+                log("controller not ready (CNR stuck)");
+                return false;
+            }
+
+            // 2. Clear RUN; wait for HCH = 1.
+            let cmd = self.op_rd32(OP_USBCMD);
+            self.op_wr32(OP_USBCMD, cmd & !USBCMD_RUN);
+            if !wait_bit(self, OP_USBSTS, USBSTS_HCH, true, HC_HALT_TIMEOUT_MS) {
+                log("controller did not halt");
+                return false;
+            }
+
+            // 3. HCRST; wait for it to clear.
+            self.op_wr32(OP_USBCMD, USBCMD_HCRST);
+            if !wait_bit(self, OP_USBCMD, USBCMD_HCRST, false, HC_RESET_TIMEOUT_MS) {
+                log("controller reset timed out");
+                return false;
+            }
+
+            // 4. Verify halted + CNR cleared.
+            if !wait_bit(self, OP_USBSTS, USBSTS_CNR, false, CNR_TIMEOUT_MS) {
+                log("CNR still set after reset");
+                return false;
+            }
+            if self.op_rd32(OP_USBSTS) & USBSTS_HCH == 0 {
+                log("controller not halted after reset");
+                return false;
+            }
+
+            // 5. Page size: we support only 4 KiB, which is bit 0.
+            self.op_wr32(OP_PAGESIZE, 1);
+
+            // 6. DCBAAP: array of (max_slots+1) u64 pointers.
+            let Some(dcba_phys) = self._dcba.phys() else {
+                log("DCBAAP has no physical address");
+                return false;
+            };
+            self.op_wr64(OP_DCBAAP, dcba_phys);
+
+            // 7. CRCR: command ring base, RCS = 1 (initial producer cycle).
+            let cmd_phys = self.cmd_ring.phys();
+            if cmd_phys == 0 {
+                log("command ring has no physical address");
+                return false;
+            }
+            self.op_wr64(OP_CRCR, cmd_phys | 1);
+
+            // 8. Event ring: ERSTSZ → ERSTBA → ERDP (spec order).
+            if !self.program_event_ring() {
+                log("event ring programming failed");
+                return false;
+            }
+
+            // 9. Interrupter 0: enable.
+            let iman = self.rt_rd32(0x20 + IR_IMAN);
+            self.rt_wr32(0x20 + IR_IMAN, iman | IMAN_IE);
+
+            // 10. MaxSlotsEn.
+            self.op_wr32(OP_CONFIG, self.max_slots);
+
+            // 11. Clear stale port-change bits before running.
+            self.clear_port_change_bits();
+
+            // 12. RUN + INTE; wait for HCH = 0.
+            self.op_wr32(OP_USBCMD, USBCMD_RUN | USBCMD_INTE);
+            if !wait_bit(self, OP_USBSTS, USBSTS_HCH, false, HC_HALT_TIMEOUT_MS) {
+                log("controller did not start");
+                return false;
+            }
         }
 
-        // 6. Set max device slots
-        self.op_write32(OP_CONFIG, self.max_slots);
+        crate::serial_println!(
+            "  [XHCI] running: {} slots, {} ports", self.max_slots, self.max_ports
+        );
 
-        // 7. Enable HC with interrupts
-        self.op_write32(OP_USBCMD, CMD_RUN | CMD_INTE);
-
-        crate::serial_println!("  [XHCI] controller running, {} ports", self.max_ports);
-
-        // 8. Reset and probe all ports
         self.probe_ports();
-
         true
     }
 
+    unsafe fn program_event_ring(&mut self) -> bool {
+        let Some(evt_phys) = self.evt_ring.phys() else { return false; };
+        let Some(erst_phys) = self._erst.phys() else { return false; };
+
+        // Write ERST[0].
+        let entry = self._erst.virt() as *mut ErstEntry;
+        entry.write_volatile(ErstEntry {
+            base: evt_phys,
+            size: self.evt_ring.size(),
+            _rsvd: 0,
+        });
+        compiler_fence(Ordering::SeqCst);
+
+        // Order matters: ERSTSZ → ERSTBA → ERDP.
+        self.rt_wr32(0x20 + IR_ERSTSZ, 1);
+        compiler_fence(Ordering::SeqCst);
+        self.rt_wr64(0x20 + IR_ERSTBA, erst_phys);
+        compiler_fence(Ordering::SeqCst);
+        self.rt_wr64(0x20 + IR_ERDP, evt_phys);
+        true
+    }
+
+    unsafe fn clear_port_change_bits(&self) {
+        for port in 0..self.max_ports {
+            let off = self.op_base + PORT_REG_BASE_OFF + port as u64 * PORT_REG_STRIDE;
+            let ps = (off as *const u32).read_volatile();
+            (off as *mut u32).write_volatile(ps | PORTSC_CHANGE_BITS);
+        }
+    }
+
+    // ----- Port probe ----------------------------------------------------
+
     fn probe_ports(&mut self) {
         for port in 0..self.max_ports {
-            let portsc_off = self.op_base + 0x400 + port as u64 * 0x10;
-            let portsc = unsafe { (portsc_off as *const u32).read_volatile() };
+            let off = self.op_base + PORT_REG_BASE_OFF + port as u64 * PORT_REG_STRIDE;
 
-            // Bit 0 = CCS (Current Connect Status)
-            if portsc & 1 == 0 { continue; }
+            unsafe {
+                // 1. Enable port power (no-op on USB 3.0).
+                let ps = (off as *const u32).read_volatile();
+                if ps & PORTSC_PP == 0 {
+                    (off as *mut u32).write_volatile(ps | PORTSC_PP);
+                    crate::arch::x86_64::timer::precise_sleep_ms(20);
+                }
 
-            // Port speed from bits 13:10
-            let speed = (portsc >> 10) & 0xF;
-            let speed_str = match speed {
-                1 => "Full-Speed (12Mbps)",
-                2 => "Low-Speed (1.5Mbps)",
-                3 => "High-Speed (480Mbps)",
-                4 => "SuperSpeed (5Gbps)",
-                _ => "Unknown",
-            };
-            crate::serial_println!("  [XHCI] port {} connected, speed={}, PORTSC=0x{:08x}",
-                port, speed_str, portsc);
+                // 2. Clear stale change bits.
+                let ps = (off as *const u32).read_volatile();
+                (off as *mut u32).write_volatile(ps | PORTSC_CHANGE_BITS);
 
-            // Port reset: set PR bit (4)
-            unsafe { (portsc_off as *mut u32).write_volatile(portsc | (1 << 4)); }
+                // 3. Connection?
+                let ps = (off as *const u32).read_volatile();
+                if ps & PORTSC_CCS == 0 {
+                    continue;
+                }
 
-            // Wait for reset to complete (PRC bit 21)
-            let dl = crate::arch::x86_64::timer::uptime_ms() + 200;
-            loop {
-                let ps = unsafe { (portsc_off as *const u32).read_volatile() };
-                if ps & (1 << 21) != 0 { break; } // PRC set
-                if crate::arch::x86_64::timer::uptime_ms() > dl { break; }
+                let speed = (ps >> 10) & 0xF;
+                crate::serial_println!(
+                    "  [XHCI] port {} connected ({})",
+                    port, speed_label(speed),
+                );
+
+                // 4. Reset. USB 3.0 uses WPR / WRC; USB 2.0 uses PR / PRC.
+                let is_usb3 = speed == 4 || speed == 5;
+                let (reset_bit, done_bit) = if is_usb3 {
+                    (PORTSC_WPR, PORTSC_WRC)
+                } else {
+                    (PORTSC_PR, PORTSC_PRC)
+                };
+
+                let ps = (off as *const u32).read_volatile();
+                (off as *mut u32).write_volatile(ps | reset_bit);
+
+                // 5. Poll for reset completion.
+                let deadline = now_ms() + PORT_RESET_TIMEOUT_MS;
+                let mut reset_done = false;
+                while now_ms() < deadline {
+                    let ps = (off as *const u32).read_volatile();
+                    if ps & done_bit != 0 {
+                        // Clear the change bit (W1C).
+                        (off as *mut u32).write_volatile(ps | done_bit);
+                        reset_done = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+
+                if !reset_done {
+                    crate::serial_println!("  [XHCI] port {} reset timeout", port);
+                    continue;
+                }
+
+                // 6. Enabled?
+                let ps = (off as *const u32).read_volatile();
+                if ps & PORTSC_PED == 0 {
+                    crate::serial_println!(
+                        "  [XHCI] port {} enabled but not PED (PORTSC=0x{:08x})",
+                        port, ps,
+                    );
+                    continue;
+                }
+
+                // 7. Enumeration would happen here. It is not implemented;
+                // record the port so a future layer can pick it up.
+                self.candidate_keyboard_ports.push(port as u8);
+                crate::serial_println!(
+                    "  [XHCI] port {} enabled — enumeration unimplemented",
+                    port,
+                );
             }
-
-            // Clear PRC by writing 1 to bit 21
-            let ps = unsafe { (portsc_off as *const u32).read_volatile() };
-            unsafe { (portsc_off as *mut u32).write_volatile(ps | (1 << 21)); }
-
-            // Check if port is enabled (PED bit 1)
-            let ps2 = unsafe { (portsc_off as *const u32).read_volatile() };
-            if ps2 & (1 << 1) == 0 {
-                crate::serial_println!("  [XHCI] port {} not enabled after reset", port);
-                continue;
-            }
-
-            // Device enumeration: Enable Slot → Address Device → Get Descriptor
-            crate::serial_println!("  [XHCI] port {} enabled — enumerating device", port);
-            self.enumerate_device(port);
         }
     }
 
-    /// Enumerate a USB device: Enable Slot, Address Device, Get Device Descriptor
-    fn enumerate_device(&mut self, port: u32) {
-        // Step 1: Enable Slot command
-        self.cmd_ring.push(Trb::enable_slot());
-        self.ring_doorbell(0, 0); // Ring HC doorbell
+    // ----- Event processing ----------------------------------------------
 
-        // Wait for completion
-        crate::arch::x86_64::timer::precise_sleep_ms(10);
-        let events = self.poll_events();
-
-        if events == 0 {
-            crate::serial_println!("  [XHCI] port {} enable slot timeout", port);
-            self.usb_keyboards.push(port as u8); // assume keyboard anyway
-            return;
-        }
-
-        // For now, assume device is a HID keyboard if port is enabled
-        // Full enumeration would: Address Device → Get Device Descriptor →
-        // Get Config Descriptor → Set Configuration → Get HID Report Descriptor
-        self.usb_keyboards.push(port as u8);
-        crate::serial_println!("  [XHCI] port {} enumerated — HID keyboard assumed", port);
-    }
-
-    /// Ring the host controller doorbell (slot 0 = command ring)
-    fn ring_doorbell(&self, slot: u32, endpoint: u32) {
-        let db_off = self.db_base + slot as u64 * 4;
-        unsafe { (db_off as *mut u32).write_volatile(endpoint); }
-    }
-
-    /// Poll event ring for completions
+    /// Process all ready events. Returns the number consumed.
+    ///
+    /// Safe to call from both the IRQ handler and the polling loop.
     pub fn poll_events(&mut self) -> usize {
         let mut count = 0;
-        loop {
-            let trb = &self.evt_ring.trbs[self.evt_dequeue];
-            let cycle = (trb.control & 1) as u8;
-            if cycle != self.evt_cycle { break; } // no more events
-
-            let trb_type = (trb.control >> 10) & 0x3F;
-            let comp_code = (trb.status >> 24) & 0xFF;
-
-            if comp_code != 1 { // 1 = Success
-                crate::serial_println!("[XHCI] event type={} code={}", trb_type, comp_code);
-            }
-
-            self.evt_dequeue += 1;
-            if self.evt_dequeue >= RING_SIZE {
-                self.evt_dequeue = 0;
-                self.evt_cycle ^= 1;
+        while let Some(trb) = self.evt_ring.pop() {
+            let trb_type = trb.trb_type();
+            let code = trb.completion_code();
+            match trb_type {
+                TRB_TYPE_TRANSFER_EVENT => {
+                    if code != COMPLETION_SUCCESS {
+                        log_completion("Transfer", code);
+                    }
+                }
+                TRB_TYPE_CMD_COMPLETION => {
+                    if code != COMPLETION_SUCCESS {
+                        log_completion("Command", code);
+                    }
+                }
+                TRB_TYPE_PORT_STATUS_CHG => {
+                    // Port status changed; re-scan ports.
+                    self.probe_ports();
+                }
+                TRB_TYPE_HOST_CONTROLLER => {
+                    if code != COMPLETION_SUCCESS {
+                        log_completion("Host", code);
+                    }
+                }
+                _ => {}
             }
             count += 1;
         }
+        if count > 0 {
+            self.evt_ring.advance_erdp(self.rt_base);
+        }
         count
+    }
+
+    // ----- Command submission --------------------------------------------
+
+    /// Push a TRB to the command ring and ring the host-controller
+    /// doorbell. The caller is responsible for waiting on the matching
+    /// command-completion event.
+    pub fn submit_command(&mut self, trb: Trb) {
+        self.cmd_ring.push(trb);
+        compiler_fence(Ordering::SeqCst);
+        let db = self.db_base;
+        unsafe { ((db) as *mut u32).write_volatile(0); }
     }
 }
 
-// ── USB HID Keyboard scancode → ASCII ─────────────────────────────────────────
-// HID Usage ID → ASCII for US layout
-static HID_TO_ASCII: [u8; 256] = {
-    let mut t = [0u8; 256];
-    // Letters a-z (HID 0x04-0x1D)
-    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-    let mut i = 0usize;
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+unsafe fn wait_bit(
+    ctrl: &XhciController,
+    reg: u64,
+    bit: u32,
+    expect_set: bool,
+    timeout_ms: u64,
+) -> bool {
+    let deadline = now_ms() + timeout_ms;
+    loop {
+        let v = ctrl.op_rd32(reg);
+        let is_set = v & bit != 0;
+        if is_set == expect_set {
+            return true;
+        }
+        if now_ms() > deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn now_ms() -> u64 {
+    crate::arch::x86_64::timer::uptime_ms()
+}
+
+fn log(msg: &str) {
+    crate::serial_println!("  [XHCI] {}", msg);
+}
+
+fn log_completion(kind: &str, code: u8) {
+    crate::serial_println!("  [XHCI] {} completion code={}", kind, code);
+}
+
+fn speed_label(speed: u32) -> &'static str {
+    match speed {
+        1 => "Full-Speed (12 Mbps)",
+        2 => "Low-Speed (1.5 Mbps)",
+        3 => "High-Speed (480 Mbps)",
+        4 => "SuperSpeed (5 Gbps)",
+        5 => "SuperSpeed+ (10 Gbps)",
+        _ => "off / unknown",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HID keyboard
+// ---------------------------------------------------------------------------
+
+/// Unshifted HID Usage → ASCII.
+///
+/// Covers 0x04..0x38 (letters, digits, punctuation, Enter, Escape,
+/// Backspace, Tab, Space). Higher usages (arrows, F-keys, keypad) are
+/// non-printable and map to 0.
+static HID_UNSHIFTED: [u8; 0x39] = {
+    let mut t = [0u8; 0x39];
+    // a..z
+    let letters: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
+    let mut i = 0;
     while i < 26 {
-        t[0x04 + i] = LETTERS[i];
+        t[0x04 + i] = letters[i];
         i += 1;
     }
-    // Numbers 1-0 (HID 0x1E-0x27)
-    t[0x1E] = b'1'; t[0x1F] = b'2'; t[0x20] = b'3'; t[0x21] = b'4'; t[0x22] = b'5';
-    t[0x23] = b'6'; t[0x24] = b'7'; t[0x25] = b'8'; t[0x26] = b'9'; t[0x27] = b'0';
-    // Special chars
-    t[0x28] = b'\n'; t[0x29] = 27;   t[0x2A] = 0x08; t[0x2B] = b'\t';
-    t[0x2C] = b' ';  t[0x2D] = b'-'; t[0x2E] = b'=';    t[0x2F] = b'[';
-    t[0x30] = b']';  t[0x31] = b'\\'; t[0x33] = b';';    t[0x34] = b'\'';
-    t[0x35] = b'`';  t[0x36] = b','; t[0x37] = b'.';    t[0x38] = b'/';
+    // 1..0
+    let digits: &[u8; 10] = b"1234567890";
+    let mut j = 0;
+    while j < 10 {
+        t[0x1E + j] = digits[j];
+        j += 1;
+    }
+    t[0x28] = b'\n';       // Enter
+    t[0x29] = 0x1B;        // Escape
+    t[0x2A] = 0x08;        // Backspace
+    t[0x2B] = b'\t';       // Tab
+    t[0x2C] = b' ';        // Space
+    t[0x2D] = b'-';
+    t[0x2E] = b'=';
+    t[0x2F] = b'[';
+    t[0x30] = b']';
+    t[0x31] = b'\\';
+    t[0x32] = b'#';        // Non-US # (US layout: #)
+    t[0x33] = b';';
+    t[0x34] = b'\'';
+    t[0x35] = b'`';
+    t[0x36] = b',';
+    t[0x37] = b'.';
+    t[0x38] = b'/';
     t
 };
 
+/// Shifted HID Usage → ASCII. Same indices as [`HID_UNSHIFTED`]; zero
+/// means "no shifted character" (fall back to unshifted).
+static HID_SHIFTED: [u8; 0x39] = {
+    let mut t = [0u8; 0x39];
+    // A..Z
+    let letters: &[u8; 26] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut i = 0;
+    while i < 26 {
+        t[0x04 + i] = letters[i];
+        i += 1;
+    }
+    // !..)
+    let shifted_digits: &[u8; 10] = b"!@#$%^&*()";
+    let mut j = 0;
+    while j < 10 {
+        t[0x1E + j] = shifted_digits[j];
+        j += 1;
+    }
+    t[0x2D] = b'_';
+    t[0x2E] = b'+';
+    t[0x2F] = b'{';
+    t[0x30] = b'}';
+    t[0x31] = b'|';
+    t[0x32] = b'~';
+    t[0x33] = b':';
+    t[0x34] = b'"';
+    t[0x35] = b'~';        // Shift+` → ~ on US layout
+    t[0x36] = b'<';
+    t[0x37] = b'>';
+    t[0x38] = b'?';
+    t
+};
+
+/// Map a HID usage to ASCII ignoring Shift. Kept for backward
+/// compatibility with the original API.
+#[must_use]
 pub fn hid_to_ascii(usage: u8) -> Option<u8> {
-    let c = HID_TO_ASCII[usage as usize];
-    if c != 0 { Some(c) } else { None }
+    hid_to_ascii_with_shift(usage, false)
 }
 
-// ── Global XHCI instance ──────────────────────────────────────────────────────
+/// Map a HID usage to ASCII, honouring Shift.
+#[must_use]
+pub fn hid_to_ascii_with_shift(usage: u8, shift: bool) -> Option<u8> {
+    let idx = usage as usize;
+    if idx >= HID_UNSHIFTED.len() {
+        return None;
+    }
+    let base = HID_UNSHIFTED[idx];
+    if base == 0 {
+        return None;
+    }
+    if shift {
+        let s = HID_SHIFTED[idx];
+        if s != 0 { return Some(s); }
+    }
+    Some(base)
+}
+
+/// HID boot-keyboard modifier bits (report byte 0).
+pub const HID_MOD_LCTRL:  u8 = 1 << 0;
+pub const HID_MOD_LSHIFT: u8 = 1 << 1;
+pub const HID_MOD_LALT:   u8 = 1 << 2;
+pub const HID_MOD_LGUI:   u8 = 1 << 3;
+pub const HID_MOD_RCTRL:  u8 = 1 << 4;
+pub const HID_MOD_RSHIFT: u8 = 1 << 5;
+pub const HID_MOD_RALT:   u8 = 1 << 6;
+pub const HID_MOD_RGUI:   u8 = 1 << 7;
+
+pub const HID_MOD_ANY_SHIFT: u8 = HID_MOD_LSHIFT | HID_MOD_RSHIFT;
+pub const HID_MOD_ANY_CTRL:  u8 = HID_MOD_LCTRL  | HID_MOD_RCTRL;
+
+/// State machine for a HID boot-protocol keyboard.
+///
+/// Feed each 8-byte report to [`HidKeyboard::process`]; it returns the
+/// ASCII bytes for keys newly pressed in that report, with Shift and
+/// CapsLock applied. Ctrl+letter produces the standard ASCII control
+/// codes (Ctrl+A = 0x01 … Ctrl+Z = 0x1A).
+pub struct HidKeyboard {
+    prev_keys: [u8; 6],
+    caps:      bool,
+}
+
+impl HidKeyboard {
+    pub const fn new() -> Self {
+        Self { prev_keys: [0; 6], caps: false }
+    }
+
+    /// Process one 8-byte boot report: `[modifiers, reserved, key0..key5]`.
+    pub fn process(&mut self, report: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if report.len() < 8 {
+            return out;
+        }
+        let mods    = report[0];
+        let shift   = mods & HID_MOD_ANY_SHIFT != 0;
+        let ctrl    = mods & HID_MOD_ANY_CTRL  != 0;
+
+        for i in 2..8 {
+            let usage = report[i];
+            if usage == 0 { continue; }
+            // Skip if it was already pressed in the previous report.
+            if self.prev_keys.iter().any(|&k| k == usage) { continue; }
+
+            // CapsLock toggle: usage 0x39.
+            if usage == 0x39 {
+                self.caps = !self.caps;
+                continue;
+            }
+
+            if let Some(byte) = hid_to_ascii_with_shift(usage, shift) {
+                // Letters: Shift XOR CapsLock determines case.
+                let letter = byte.is_ascii_alphabetic();
+                let byte = if letter && self.caps {
+                    if byte.is_ascii_lowercase() { byte.to_ascii_uppercase() }
+                    else { byte.to_ascii_lowercase() }
+                } else {
+                    byte
+                };
+                // Ctrl+letter → control code.
+                let byte = if ctrl && byte.is_ascii_alphabetic() {
+                    byte.to_ascii_lowercase() - b'a' + 1
+                } else {
+                    byte
+                };
+                out.push(byte);
+            }
+        }
+
+        self.prev_keys.copy_from_slice(&report[2..8]);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global instance
+// ---------------------------------------------------------------------------
+
 static XHCI: Mutex<Option<XhciController>> = Mutex::new(None);
 
-pub fn try_init(dev: &PciDevice) -> bool {
-    if dev.class != 0x0C || dev.subclass != 0x03 || dev.prog_if != 0x30 { return false; }
+// ---------------------------------------------------------------------------
+// Init entry point
+// ---------------------------------------------------------------------------
 
-    let bar0 = (dev.bar[0] & !0xF) as u64 | ((dev.bar[1] as u64) << 32);
-    if bar0 == 0 { return false; }
+/// Attempt to bring up the XHCI controller from a PCI device.
+pub fn try_init(dev: &PciDevice) -> bool {
+    // XHCI is class 0x0C (serial bus), subclass 0x03 (USB), prog_if 0x30.
+    if dev.class != 0x0C || dev.subclass != 0x03 || dev.prog_if != 0x30 {
+        return false;
+    }
+
+    // BAR0 must be a 64-bit MMIO BAR (type bits [2:1] = 10).
+    if dev.bar[0] & 0x1 != 0 {
+        return false;
+    }
+    if (dev.bar[0] & 0x6) != 0x4 {
+        return false;
+    }
+
+    let bar_lo = (dev.bar[0] & !0xF) as u64;
+    let bar_hi = (dev.bar[1] as u64) << 32;
+    let bar_phys = bar_hi | bar_lo;
+    if bar_phys == 0 {
+        return false;
+    }
+
+    let Some(base) = (bar_phys as usize).checked_add(PHYS_OFFSET).map(|a| a as u64) else {
+        return false;
+    };
+
+    if XHCI.lock().is_some() {
+        return false;
+    }
 
     crate::pci::enable_device(dev.addr.bus, dev.addr.device, dev.addr.function);
 
-    let phys_off = 0xFFFF_8000_0000_0000u64;
-    let base     = phys_off + bar0;
+    // Read capability registers.
+    let cap_len = unsafe { (base as *const u8).read_volatile() } as u64;
+    let op_base = base + cap_len;
 
-    let cap_len   = unsafe { (base as *const u8).read_volatile() } as u64;
-    let op_base   = base + cap_len;
-
-    let hcs1      = unsafe { ((base + CAP_HCSPARAMS1) as *const u32).read_volatile() };
+    let hcs1 = unsafe { ((base + CAP_HCSPARAMS1) as *const u32).read_volatile() };
     let max_slots = hcs1 & 0xFF;
     let max_ports = (hcs1 >> 24) & 0xFF;
 
-    let db_off    = unsafe { ((base + CAP_DBOFF) as *const u32).read_volatile() } as u64 & !3;
-    let rt_off    = unsafe { ((base + CAP_RTSOFF) as *const u32).read_volatile() } as u64 & !31;
+    let db_off = (unsafe { ((base + CAP_DBOFF) as *const u32).read_volatile() }) as u64 & !3;
+    let rt_off = (unsafe { ((base + CAP_RTSOFF) as *const u32).read_volatile() }) as u64 & !31;
 
-    crate::serial_println!("  [XHCI] BAR=0x{:x} slots={} ports={}", bar0, max_slots, max_ports);
+    crate::serial_println!(
+        "  [XHCI] BAR=0x{:x}, slots={}, ports={}", bar_phys, max_slots, max_ports
+    );
 
-    let mut ctrl = XhciController {
-        base, op_base,
-        db_base: base + db_off,
-        rt_base: base + rt_off,
-        cmd_ring: TrbRing::new(),
-        evt_ring: TrbRing::new(),
-        evt_dequeue: 0,
-        evt_cycle: 1,
-        max_slots, max_ports,
-        usb_keyboards: Vec::new(),
+    let (Some(cmd_ring), Some(evt_ring), Some(dcba), Some(erst)) = (
+        CommandRing::new(),
+        EventRing::new(),
+        Dma::new((max_slots as usize + 1) * 8, RING_ALIGN),
+        Dma::new(core::mem::size_of::<ErstEntry>(), RING_ALIGN),
+    ) else {
+        log("DMA allocation failed");
+        return false;
     };
 
-    let ok = ctrl.init();
-    if ok {
-        let kbs = ctrl.usb_keyboards.len();
-        *XHCI.lock() = Some(ctrl);
-        crate::serial_println!("  [XHCI] ready, {} keyboard(s) detected", kbs);
+    let mut ctrl = XhciController {
+        base,
+        op_base,
+        db_base: base + db_off,
+        rt_base: base + rt_off,
+        max_slots,
+        max_ports,
+        cmd_ring,
+        evt_ring,
+        _dcba: dcba,
+        _erst: erst,
+        candidate_keyboard_ports: Vec::new(),
+    };
+
+    if !ctrl.init() {
+        return false;
     }
-    ok
+
+    let candidates = ctrl.candidate_keyboard_ports.len();
+    *XHCI.lock() = Some(ctrl);
+    crate::serial_println!(
+        "  [XHCI] ready ({} ports enumerated, {} candidates)",
+        max_ports, candidates,
+    );
+    true
 }
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if an XHCI controller is installed.
+pub fn is_present() -> bool {
+    XHCI.lock().is_some()
+}
+
+/// Poll the event ring. Intended to be called from an IRQ or a
+/// periodic polling loop.
 pub fn poll() {
-    if let Some(ref mut ctrl) = *XHCI.lock() {
+    if let Some(ctrl) = XHCI.lock().as_mut() {
         ctrl.poll_events();
     }
 }
 
-pub fn is_present() -> bool { XHCI.lock().is_some() }
-
-
-// ── USB HID Mouse support ─────────────────────────────────────────────────────
-
-/// Poll USB HID mouse reports from xHCI interrupt endpoint
-/// Called from GUI event loop alongside PS/2 poll
-pub fn poll_mouse_hid() {
-    let mut xhci = XHCI.lock();
-    let ctrl = match xhci.as_mut() { Some(c) => c, None => return };
-
-    let events = ctrl.poll_events();
-    // For each transfer event, read the HID report from the data buffer
-    // In QEMU USB tablet mode (absolute positioning), report format:
-    //   byte[0]: buttons
-    //   byte[1-2]: X (0..32767)
-    //   byte[3-4]: Y (0..32767)
-    // In boot protocol mouse mode (relative):
-    //   byte[0]: buttons, byte[1]: dx, byte[2]: dy
-    if events > 0 {
-        // Simplified: read from a fixed HID data buffer (QEMU provides this)
-        // Real impl: track the data buffer address from TRB descriptor setup
-        crate::serial_println!("  [USB] {} HID event(s) processed", events);
-    }
+/// Submit an Enable Slot command. Provided as a primitive for a future
+/// enumeration layer. **This function does not complete the command** —
+/// the caller must wait on the command-completion event with the
+/// matching slot-type / command slot ID.
+pub fn submit_enable_slot() -> bool {
+    let Some(ctrl) = XHCI.lock().as_mut() else { return false; };
+    ctrl.submit_command(Trb::enable_slot());
+    true
 }
 
-/// Handle raw USB HID mouse report (4 bytes: buttons, dx, dy, wheel)
+/// Return the ports that have a USB device attached and enabled.
+///
+/// Because enumeration is not implemented, this is the best the driver
+/// can report today: "something is plugged in, but we can't yet talk to
+/// it." A future commit will replace this with a list of HID devices.
+pub fn enabled_ports() -> Vec<u8> {
+    XHCI.lock()
+        .as_ref()
+        .map(|c| c.candidate_keyboard_ports.clone())
+        .unwrap_or_default()
+}
+
+/// **Stub.** The original driver logged a message; the fix is honest
+/// about the fact that HID endpoint polling is not implemented. If you
+/// need a working mouse on a system with XHCI only, use the PS/2
+/// emulation path (or a system whose firmware exposes a PS/2 mouse)
+/// until this layer is completed.
+pub fn poll_mouse_hid() {
+    // No USB mouse support; nothing to do.
+}
+
+/// **Stub.** Forwarded to the PS/2-layer HID report parser, which
+/// remains the canonical decoder. A future XHCI enumeration
+/// implementation will feed real HID reports here.
 pub fn handle_mouse_report(report: &[u8]) {
     crate::drivers::mouse::handle_hid_report(report);
 }
+
+// Silence unused-import lint for the constant used only in the doc.
+#[allow(dead_code)]
+const _PLS_SHIFT_DOC: u32 = PORTSC_PLS_SHIFT;
